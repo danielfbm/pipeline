@@ -1077,6 +1077,7 @@ func (c *Reconciler) createChildPipelineRun(
 			Annotations:     createChildResourceAnnotations(pr),
 		},
 		Spec: v1.PipelineRunSpec{
+			PipelineRef:  rpt.PipelineTask.PipelineRef,
 			PipelineSpec: rpt.PipelineTask.PipelineSpec,
 		},
 	}
