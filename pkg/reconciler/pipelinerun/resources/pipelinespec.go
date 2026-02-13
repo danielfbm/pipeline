@@ -8,6 +8,7 @@ type ResolvedPipeline struct {
 	PipelineName string
 	Kind         string
 	PipelineSpec *v1.PipelineSpec
+	PipelineRef  *v1.PipelineRef
 }
 
 // GetPipelineRun is a function used to retrieve child PipelineRuns

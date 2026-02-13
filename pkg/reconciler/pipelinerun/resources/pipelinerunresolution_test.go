@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
@@ -2742,12 +2741,19 @@ func TestResolvePipelineRun_PipelineTaskHasPipelineRef(t *testing.T) {
 		},
 	}
 
-	_, err := ResolvePipelineTask(t.Context(), pr, nopGetPipelineRun, getTask, getTaskRun, nopGetCustomRun, pt, nil)
-	if err == nil {
-		t.Errorf("Error getting tasks for fake pipeline %s, expected an error but got nil.", p.ObjectMeta.Name)
+	getPipelineRun := func(name string) (*v1.PipelineRun, error) {
+		return nil, kerrors.NewNotFound(v1.Resource("pipelinerun"), name)
 	}
-	if !strings.Contains(err.Error(), "does not support PipelineRef, please use PipelineSpec, TaskRef or TaskSpec instead") {
-		t.Errorf("Error getting tasks for fake pipeline %s: expected contains keyword but got %s", p.ObjectMeta.Name, err)
+
+	rpt, err := ResolvePipelineTask(t.Context(), pr, getPipelineRun, getTask, getTaskRun, nopGetCustomRun, pt, nil)
+	if err != nil {
+		t.Errorf("ResolvePipelineTask failed: %v", err)
+	}
+	if rpt.ResolvedPipeline.PipelineRef == nil {
+		t.Errorf("Expected PipelineRef to be set, but got nil")
+	}
+	if rpt.ResolvedPipeline.PipelineRef.Name != "pipeline" {
+		t.Errorf("Expected PipelineRef name to be 'pipeline', but got %q", rpt.ResolvedPipeline.PipelineRef.Name)
 	}
 }
 
