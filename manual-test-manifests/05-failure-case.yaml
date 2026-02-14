@@ -1,0 +1,17 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: failure-parent-pipeline
+spec:
+  tasks:
+    - name: call-missing-child
+      pipelineRef:
+        name: this-pipeline-does-not-exist
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: run-failure-parent-
+spec:
+  pipelineRef:
+    name: failure-parent-pipeline

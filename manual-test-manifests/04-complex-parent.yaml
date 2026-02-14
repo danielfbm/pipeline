@@ -1,0 +1,50 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: complex-parent-pipeline
+spec:
+  workspaces:
+    - name: parent-ws
+  tasks:
+    - name: call-child-with-context
+      pipelineRef:
+        name: complex-child-pipeline
+      params:
+        - name: child-message
+          value: "Message passed from Parent to Child!"
+      workspaces:
+        - name: child-ws
+          workspace: parent-ws
+    - name: read-it
+      taskRef:
+        name: read-it
+      params:
+        - name: file
+          value: message.txt
+      workspaces:
+        - name: data
+          workspace: parent-ws
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: run-complex-parent-
+spec:
+  pipelineRef:
+    name: complex-parent-pipeline
+  taskRunTemplate:
+    podTemplate:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 65532
+  workspaces:
+    - name: parent-ws
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Mi

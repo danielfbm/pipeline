@@ -1,0 +1,36 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: hello-task
+spec:
+  params:
+    - name: message
+      type: string
+      default: "Hello World"
+  steps:
+    - name: echo
+      image: cgr.dev/chainguard/busybox@sha256:19f02276bf8dbdd62f069b922f10c65262cc34b710eea26ff928129a736be791
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      script: |
+        #!/bin/sh
+        echo "$(params.message)"
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: simple-child-pipeline
+spec:
+  tasks:
+    - name: task1
+      taskRef:
+        name: hello-task
+      params:
+        - name: message
+          value: "I am the child pipeline!"
