@@ -152,7 +152,7 @@ func (t ResolvedPipelineTask) IsCustomTask() bool {
 
 // IsChildPipeline returns true if the PipelineTask references a child Pipeline.
 func (t ResolvedPipelineTask) IsChildPipeline() bool {
-	return t.PipelineTask.PipelineSpec != nil
+	return t.PipelineTask.PipelineSpec != nil || t.PipelineTask.PipelineRef != nil
 }
 
 // getReason returns the latest reason if the run has completed successfully
@@ -755,7 +755,7 @@ func (t *ResolvedPipelineTask) setChildPipelineRunsAndResolvedPipeline(
 	case pipelineTask.PipelineSpec != nil:
 		rp.PipelineSpec = pipelineTask.PipelineSpec
 	case pipelineTask.PipelineRef != nil:
-		return fmt.Errorf("PipelineRef for PipelineTask %q is not yet implemented", pipelineTask.Name)
+		rp.PipelineRef = pipelineTask.PipelineRef
 	default:
 		return fmt.Errorf("PipelineSpec in PipelineTask %q missing", pipelineTask.Name)
 	}

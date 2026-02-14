@@ -26,6 +26,7 @@ import (
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline"
 	v1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	th "github.com/tektoncd/pipeline/pkg/reconciler/testing"
+	"github.com/tektoncd/pipeline/test/parse"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	knativetest "knative.dev/pkg/test"
@@ -360,5 +361,91 @@ func checkAnnotationPropagationToChildPipelineRun(
 
 	if len(annotations) > 0 {
 		t.Logf("Propagated annotations: %#v", annotations)
+	}
+}
+
+// @test:execution=parallel
+func TestPipelineRef_ChildExecution(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c, namespace := setup(ctx, t, requireAnyGate(map[string]string{
+		"enable-api-fields": "alpha",
+	}))
+	knativetest.CleanupOnInterrupt(func() { tearDown(ctx, t, c, namespace) }, t.Logf)
+	defer tearDown(ctx, t, c, namespace)
+
+	// GIVEN
+	t.Logf("Setting up test resources for child PipelineRun from PipelineRef in namespace %q", namespace)
+
+	childPipelineName := "child-pipeline"
+	childPipeline := parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  tasks:
+  - name: child-task
+    taskSpec:
+      steps:
+      - name: mystep
+        image: mirror.gcr.io/busybox
+        script: 'echo "Hello from child Pipeline!"'
+`, childPipelineName, namespace))
+
+	if _, err := c.V1PipelineClient.Create(ctx, childPipeline, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create Child Pipeline `%s`: %s", childPipeline.Name, err)
+	}
+
+	parentPipelineName := "parent-pipeline"
+	parentPipeline := parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  tasks:
+  - name: child-pipeline-task
+    pipelineRef:
+      name: %s
+`, parentPipelineName, namespace, childPipelineName))
+
+	parentPipelineRunName := "parent-pipeline-run-ref"
+	parentPipelineRun := parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  pipelineRef:
+    name: %s
+`, parentPipelineRunName, namespace, parentPipelineName))
+
+	// WHEN
+	createResourcesAndWaitForPipelineRun(ctx, t, c, namespace, parentPipeline, parentPipelineRun, nil)
+
+	// THEN
+	expectedChildPipelineRunName := parentPipelineRunName + "-child-pipeline-task"
+	t.Logf("Making sure the expected child PipelineRun %q was created", expectedChildPipelineRunName)
+	actualCpr, err := c.V1PipelineRunClient.Get(ctx, expectedChildPipelineRunName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Error listing child PipelineRuns for PipelineRun %s: %s", expectedChildPipelineRunName, err)
+	}
+	th.CheckPipelineRunConditionStatusAndReason(
+		t,
+		actualCpr.Status,
+		corev1.ConditionTrue,
+		v1.PipelineRunReasonSuccessful.String(),
+	)
+
+	if actualCpr.Spec.PipelineRef == nil || actualCpr.Spec.PipelineRef.Name != childPipelineName {
+		t.Errorf("Expected child PipelineRun to reference pipeline %s, but got %v", childPipelineName, actualCpr.Spec.PipelineRef)
+	}
+
+	// Check label propagation
+	if actualCpr.Labels[pipeline.PipelineLabelKey] != childPipelineName {
+		t.Errorf("Expected label %s to be %s, but got %s", pipeline.PipelineLabelKey, childPipelineName, actualCpr.Labels[pipeline.PipelineLabelKey])
+	}
+	if actualCpr.Labels[pipeline.PipelineRunLabelKey] != parentPipelineRunName {
+		t.Errorf("Expected label %s to be %s, but got %s", pipeline.PipelineRunLabelKey, parentPipelineRunName, actualCpr.Labels[pipeline.PipelineRunLabelKey])
 	}
 }

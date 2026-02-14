@@ -1,0 +1,24 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: simple-parent-pipeline
+spec:
+  tasks:
+    - name: call-child
+      pipelineRef:
+        name: simple-child-pipeline
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: run-basic-parent-
+spec:
+  pipelineRef:
+    name: simple-parent-pipeline
+  taskRunTemplate:
+    podTemplate:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 65532

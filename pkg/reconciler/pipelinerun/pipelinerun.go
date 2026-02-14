@@ -1043,6 +1043,9 @@ func (c *Reconciler) createChildPipelineRuns(
 	var childPipelineRuns []*v1.PipelineRun
 	for _, childPipelineRunName := range rpt.ChildPipelineRunNames {
 		var params v1.Params
+		if rpt.PipelineTask.Params != nil {
+			params = rpt.PipelineTask.Params
+		}
 		childPipelineRun, err := c.createChildPipelineRun(ctx, childPipelineRunName, params, rpt, pr, facts)
 		if err != nil {
 			err := c.handleRunCreationError(pr, err)
@@ -1077,8 +1080,42 @@ func (c *Reconciler) createChildPipelineRun(
 			Annotations:     createChildResourceAnnotations(pr),
 		},
 		Spec: v1.PipelineRunSpec{
+			PipelineRef:  rpt.PipelineTask.PipelineRef,
 			PipelineSpec: rpt.PipelineTask.PipelineSpec,
+			Params:       params,
 		},
+	}
+
+	if rpt.PipelineTask.Timeout != nil {
+		newChildPipelineRun.Spec.Timeouts = &v1.TimeoutFields{
+			Pipeline: rpt.PipelineTask.Timeout,
+		}
+	}
+
+	taskRunSpec := pr.GetTaskRunSpec(rpt.PipelineTask.Name)
+	newChildPipelineRun.Spec.TaskRunTemplate = v1.PipelineTaskRunTemplate{
+		PodTemplate:        taskRunSpec.PodTemplate,
+		ServiceAccountName: taskRunSpec.ServiceAccountName,
+	}
+
+	if len(rpt.PipelineTask.Workspaces) > 0 {
+		for _, wptb := range rpt.PipelineTask.Workspaces {
+			for _, wb := range pr.Spec.Workspaces {
+				if wb.Name == wptb.Workspace {
+					newChildPipelineRun.Spec.Workspaces = append(newChildPipelineRun.Spec.Workspaces, v1.WorkspaceBinding{
+						Name:                  wptb.Name,
+						SubPath:               filepath.Join(wb.SubPath, wptb.SubPath),
+						VolumeClaimTemplate:   wb.VolumeClaimTemplate,
+						PersistentVolumeClaim: wb.PersistentVolumeClaim,
+						EmptyDir:              wb.EmptyDir,
+						ConfigMap:             wb.ConfigMap,
+						Secret:                wb.Secret,
+						Projected:             wb.Projected,
+						CSI:                   wb.CSI,
+					})
+				}
+			}
+		}
 	}
 
 	logger.Infof(

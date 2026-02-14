@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-flags
+  namespace: tekton-pipelines
+data:
+  # Enable security context for injected containers (prepare, place-scripts)
+  # This is required for clusters with "restricted" PodSecurityStandards.
+  set-security-context: "true"
+  # Enable alpha fields for pipelineRef support
+  enable-api-fields: "alpha"

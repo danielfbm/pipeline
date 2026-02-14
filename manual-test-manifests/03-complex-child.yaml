@@ -1,0 +1,80 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: write-task
+spec:
+  params:
+    - name: content
+      type: string
+  workspaces:
+    - name: data
+  steps:
+    - name: write
+      image: cgr.dev/chainguard/busybox@sha256:19f02276bf8dbdd62f069b922f10c65262cc34b710eea26ff928129a736be791
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      script: |
+        echo "$(params.content)" > $(workspaces.data.path)/message.txt
+        cat $(workspaces.data.path)/message.txt
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: read-it
+spec:
+  params:
+    - name: file
+      type: string
+      default: "message.txt"
+  workspaces:
+    - name: data
+  steps:
+    - name: echo
+      image: cgr.dev/chainguard/busybox@sha256:19f02276bf8dbdd62f069b922f10c65262cc34b710eea26ff928129a736be791
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      script: |
+        echo "Will read file..."
+        cat $(workspaces.data.path)/message.txt
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: complex-child-pipeline
+spec:
+  params:
+    - name: child-message
+      type: string
+  workspaces:
+    - name: child-ws
+  tasks:
+    - name: write-it
+      taskRef:
+        name: write-task
+      params:
+        - name: content
+          value: $(params.child-message)
+      workspaces:
+        - name: data
+          workspace: child-ws
+    - name: read-it
+      taskRef:
+        name: read-it
+      params:
+        - name: file
+          value: message.txt
+      workspaces:
+        - name: data
+          workspace: child-ws
