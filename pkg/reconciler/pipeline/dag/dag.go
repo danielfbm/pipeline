@@ -81,7 +81,7 @@ func Build(tasks Tasks, deps map[string][]string) (*Graph, error) {
 	}
 
 	// Ensure no cycles in the graph
-	if err := findCyclesInDependencies(deps); err != nil {
+	if err := FindCyclesInDependencies(deps); err != nil {
 		return nil, fmt.Errorf("cycle detected; %w", err)
 	}
 
@@ -131,8 +131,10 @@ func linkPipelineTasks(prev *Node, next *Node) {
 	prev.Next = append(prev.Next, next)
 }
 
-// use Kahn's algorithm to find cycles in dependencies
-func findCyclesInDependencies(deps map[string][]string) error {
+// FindCyclesInDependencies uses Kahn's algorithm to find cycles in dependencies.
+// deps is a map from a node to its list of dependencies.
+// Returns an error describing the cycle if one is found.
+func FindCyclesInDependencies(deps map[string][]string) error {
 	independentTasks := sets.NewString()
 	dag := make(map[string]sets.String, len(deps))
 	childMap := make(map[string]sets.String, len(deps))

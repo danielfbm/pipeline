@@ -245,27 +245,19 @@ spec:
 		childPipelineName,
 		uid,
 	)
-	// Add cycle-detection ancestry annotations (set by the reconciler for PipelineRef tasks).
-	childObjectMeta.Annotations = map[string]string{
-		pipeline.PipelinePIPAncestryAnnotationKey: parentPipelineName,
-		pipeline.PipelinePIPNameAnnotationKey:     childPipelineName,
-	}
+	// Override the pipeline label with the child's actual pipeline name
+	// (the reconciler does this to avoid propagating the parent's label).
+	childObjectMeta.Labels[pipeline.PipelineLabelKey] = childPipelineName
 	expectedChildPipelineRun := parse.MustParseChildPipelineRunWithObjectMeta(
 		t,
 		childObjectMeta,
 		fmt.Sprintf(`
 spec:
-  pipelineSpec:
-    tasks:
-    - name: %s
-      taskSpec:
-        steps:
-        - name: mystep
-          image: mirror.gcr.io/busybox
-          script: 'echo "Hello from child PipelineRun!"'
+  pipelineRef:
+    name: %s
   taskRunTemplate:
     serviceAccountName: default
-`, childPipelineTaskName),
+`, childPipelineName),
 	)
 
 	return childPipeline, parentPipeline, parentPipelineRun, expectedChildPipelineRun

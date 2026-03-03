@@ -459,6 +459,109 @@ func reconcileWithError(
 	return reconciledRun
 }
 
+// TestReconcile_ChildPipelineRunPipelineRefCycleDetection verifies that a pipeline cycle
+// (A -> B -> A) is detected and the PipelineRun is marked as failed.
+func TestReconcile_ChildPipelineRunPipelineRefCycleDetection(t *testing.T) {
+	names.TestingSeed()
+	namespace := "foo"
+
+	// Pipeline A references Pipeline B, and Pipeline B references Pipeline A
+	pipelineA := &v1.Pipeline{
+		ObjectMeta: metav1.ObjectMeta{Name: "pipeline-a", Namespace: namespace},
+		Spec: v1.PipelineSpec{
+			Tasks: []v1.PipelineTask{{
+				Name:        "ref-b",
+				PipelineRef: &v1.PipelineRef{Name: "pipeline-b"},
+			}},
+		},
+	}
+	pipelineB := &v1.Pipeline{
+		ObjectMeta: metav1.ObjectMeta{Name: "pipeline-b", Namespace: namespace},
+		Spec: v1.PipelineSpec{
+			Tasks: []v1.PipelineTask{{
+				Name:        "ref-a",
+				PipelineRef: &v1.PipelineRef{Name: "pipeline-a"},
+			}},
+		},
+	}
+
+	pr := &v1.PipelineRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cycle-pr",
+			Namespace: namespace,
+			Labels:    map[string]string{pipeline.PipelineLabelKey: "pipeline-a"},
+		},
+		Spec: v1.PipelineRunSpec{
+			PipelineRef: &v1.PipelineRef{Name: "pipeline-a"},
+		},
+	}
+
+	testData := test.Data{
+		PipelineRuns: []*v1.PipelineRun{pr},
+		Pipelines:    []*v1.Pipeline{pipelineA, pipelineB},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	}
+
+	prt := newPipelineRunTest(t, testData)
+	defer prt.Cancel()
+
+	reconciledRun, _ := prt.reconcileRun(namespace, pr.Name, []string{}, true)
+
+	// The run should be marked as failed due to cycle detection
+	th.CheckPipelineRunConditionStatusAndReason(
+		t,
+		reconciledRun.Status,
+		corev1.ConditionFalse,
+		"CreateRunFailed",
+	)
+}
+
+// TestReconcile_ChildPipelineRunPipelineRefNotFound verifies that when a PipelineTask
+// references a nonexistent Pipeline, the PipelineRun is marked as failed.
+func TestReconcile_ChildPipelineRunPipelineRefNotFound(t *testing.T) {
+	names.TestingSeed()
+	namespace := "foo"
+
+	parentPipeline := &v1.Pipeline{
+		ObjectMeta: metav1.ObjectMeta{Name: "parent-pipeline", Namespace: namespace},
+		Spec: v1.PipelineSpec{
+			Tasks: []v1.PipelineTask{{
+				Name:        "ref-nonexistent",
+				PipelineRef: &v1.PipelineRef{Name: "nonexistent-pipeline"},
+			}},
+		},
+	}
+
+	pr := &v1.PipelineRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "not-found-pr",
+			Namespace: namespace,
+		},
+		Spec: v1.PipelineRunSpec{
+			PipelineRef: &v1.PipelineRef{Name: "parent-pipeline"},
+		},
+	}
+
+	testData := test.Data{
+		PipelineRuns: []*v1.PipelineRun{pr},
+		Pipelines:    []*v1.Pipeline{parentPipeline},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	}
+
+	prt := newPipelineRunTest(t, testData)
+	defer prt.Cancel()
+
+	reconciledRun, _ := prt.reconcileRun(namespace, pr.Name, []string{}, true)
+
+	// The run should be marked as failed since the referenced pipeline doesn't exist
+	th.CheckPipelineRunConditionStatusAndReason(
+		t,
+		reconciledRun.Status,
+		corev1.ConditionFalse,
+		v1.PipelineRunReasonCouldntGetPipeline.String(),
+	)
+}
+
 // TestReconcile_ChildPipelineRunPipelineRef verifies that a PipelineTask with a pipelineRef (instead
 // of inline pipelineSpec) is correctly resolved and creates a child PipelineRun with the resolved spec.
 func TestReconcile_ChildPipelineRunPipelineRef(t *testing.T) {
