@@ -2643,7 +2643,7 @@ func TestResolvePipelineRun_CustomTask(t *testing.T) {
 	}
 }
 
-func TestResolvePipelineRun_ChildPipeline(t *testing.T) {
+func TestResolvePipelineRun_ChildPipelineWithPipelineSpec(t *testing.T) {
 	cfg := config.NewStore(logtesting.TestLogger(t))
 	ctx := cfg.ToContext(t.Context())
 
@@ -3258,7 +3258,7 @@ func TestIsChildPipeline(t *testing.T) {
 	getTaskRun := getTaskRunFn(nil)
 	getChildPipelineRun := func(name string) (*v1.PipelineRun, error) { return nil, nil } //nolint:nilnil
 	childPipeline := &v1.Pipeline{
-		ObjectMeta: metav1.ObjectMeta{Name: "some-pipeline"},
+		ObjectMeta: metav1.ObjectMeta{Name: "child-pipeline"},
 		Spec:       v1.PipelineSpec{},
 	}
 	getPipeline := func(_ context.Context, _ string) (*v1.Pipeline, *v1.RefSource, *trustedresources.VerificationResult, error) {
@@ -3286,7 +3286,7 @@ func TestIsChildPipeline(t *testing.T) {
 	}, {
 		name: "pipelineTask with PipelineRef",
 		pt: v1.PipelineTask{
-			PipelineRef: &v1.PipelineRef{Name: "some-pipeline"},
+			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
 		},
 		want: true,
 	}} {
@@ -6153,6 +6153,19 @@ func TestSetChildPipelineRunsAndResolvedPipeline(t *testing.T) {
 		},
 		getPipelineFn: func(_ context.Context, _ string) (*v1.Pipeline, *v1.RefSource, *trustedresources.VerificationResult, error) {
 			return nil, nil, nil, remote.ErrRequestInProgress
+		},
+		pipelineTask: v1.PipelineTask{
+			Name:        "pip-task",
+			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+		},
+		wantErr: true,
+	}, {
+		name: "PipelineRef resolution — transient error",
+		childPipelineRunFn: func(name string) (*v1.PipelineRun, error) {
+			return nil, kerrors.NewNotFound(v1.Resource("pipelinerun"), name)
+		},
+		getPipelineFn: func(_ context.Context, _ string) (*v1.Pipeline, *v1.RefSource, *trustedresources.VerificationResult, error) {
+			return nil, nil, nil, kerrors.NewConflict(v1.Resource("pipeline"), "child-pipeline", errors.New("conflict"))
 		},
 		pipelineTask: v1.PipelineTask{
 			Name:        "pip-task",

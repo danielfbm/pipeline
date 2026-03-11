@@ -17,3 +17,5 @@ limitations under the License.
 package dag
 
 // exports for tests
+
+var FindCyclesInDependencies = findCyclesInDependencies
