@@ -1082,10 +1082,11 @@ func (c *Reconciler) createChildPipelineRun(
 	logger := logging.FromContext(ctx)
 	rpt.PipelineTask = resources.ApplyPipelineTaskContexts(rpt.PipelineTask, pr.Status, facts)
 
-	// For PipelineRef tasks, detect and prevent pipeline-in-pipeline cycles using DAG-based detection.
+	// For PipelineRef tasks, detect and prevent pipeline-in-pipeline cycles
+	// by walking up the ownerReferences chain and checking tekton.dev/pipeline labels.
 	if rpt.PipelineTask.PipelineRef != nil && rpt.ResolvedPipeline.PipelineName != "" {
-		currentPipelineName := pr.Labels[pipeline.PipelineLabelKey]
-		if err := detectPipelineRefCycles(currentPipelineName, rpt); err != nil {
+		targetPipelineName := rpt.ResolvedPipeline.PipelineName
+		if err := c.detectPipelineRefCycle(ctx, pr, targetPipelineName); err != nil {
 			return nil, controller.NewPermanentError(err)
 		}
 	}
@@ -1099,8 +1100,46 @@ func (c *Reconciler) createChildPipelineRun(
 		childLabels[pipeline.PipelineLabelKey] = rpt.ResolvedPipeline.PipelineName
 	}
 
+	// Map workspace bindings from the parent PipelineRun to the child PipelineRun
+	// based on the PipelineTask workspace mappings.
+	var pipelinePVCWorkspaceName string
+	var childWorkspaces []v1.WorkspaceBinding
+	if len(rpt.PipelineTask.Workspaces) > 0 {
+		parentWorkspaces := make(map[string]v1.WorkspaceBinding)
+		for _, binding := range pr.Spec.Workspaces {
+			parentWorkspaces[binding.Name] = binding
+		}
+		for _, ws := range rpt.PipelineTask.Workspaces {
+			childPipelineWorkspaceName, childPipelineSubPath, pipelineWorkspaceName := ws.Name, ws.SubPath, ws.Workspace
+			parentName := pipelineWorkspaceName
+			if parentName == "" {
+				parentName = childPipelineWorkspaceName
+			}
+			if b, hasBinding := parentWorkspaces[parentName]; hasBinding {
+				if b.PersistentVolumeClaim != nil || b.VolumeClaimTemplate != nil {
+					pipelinePVCWorkspaceName = parentName
+				}
+
+				aaBehavior, err := affinityassistant.GetAffinityAssistantBehavior(ctx)
+				if err != nil {
+					return nil, err
+				}
+
+				// Reuses the task workspace binding logic which already
+				// cover cases PVC, VolumeTemplates which is identical in this case
+				workspace := c.taskWorkspaceByWorkspaceVolumeSource(ctx, pipelinePVCWorkspaceName, pr.Name, b, childPipelineWorkspaceName, childPipelineSubPath, *kmeta.NewControllerRef(pr), aaBehavior)
+				childWorkspaces = append(childWorkspaces, workspace)
+			}
+			// TODO: Add non-optional workspace verification for unbound workspaces like tasks
+			// this would raise an error in the parent PipelineRun. Current implementation
+			// will raise the error in the child PipelineRun.
+		}
+	}
+
 	childSpec := v1.PipelineRunSpec{
 		TaskRunTemplate: pr.Spec.TaskRunTemplate,
+		Params:          rpt.PipelineTask.Params,
+		Workspaces:      childWorkspaces,
 	}
 	if rpt.PipelineTask.PipelineRef != nil {
 		childSpec.PipelineRef = rpt.PipelineTask.PipelineRef
@@ -1130,45 +1169,41 @@ func (c *Reconciler) createChildPipelineRun(
 		Create(ctx, newChildPipelineRun, metav1.CreateOptions{})
 }
 
-// detectPipelineRefCycles checks for cycles in pipeline-in-pipeline references using
-// DAG-based cycle detection. It builds a dependency map from the current pipeline to
-// the target pipeline and recursively walks the resolved pipeline spec to detect
-// any nested PipelineRef tasks that could form a cycle.
-func detectPipelineRefCycles(currentPipelineName string, rpt *resources.ResolvedPipelineTask) error {
-	if currentPipelineName == "" {
-		return nil
-	}
-	deps := map[string][]string{
-		currentPipelineName: {rpt.ResolvedPipeline.PipelineName},
-	}
-	// Walk the resolved pipeline spec for nested PipelineRef tasks.
-	if rpt.ResolvedPipeline.PipelineSpec != nil {
-		collectPipelineRefDeps(rpt.ResolvedPipeline.PipelineName, rpt.ResolvedPipeline.PipelineSpec, deps)
-	}
-	return dag.FindCyclesInDependencies(deps)
-}
+// detectPipelineRefCycle walks up the ownerReferences chain from the current PipelineRun
+// and checks the tekton.dev/pipeline label at each level. If the target pipeline name
+// appears in any ancestor, a cycle is detected.
+func (c *Reconciler) detectPipelineRefCycle(ctx context.Context, pr *v1.PipelineRun, targetPipelineName string) error {
+	logger := logging.FromContext(ctx)
+	current := pr
+	var visited []string
+	for {
+		pipelineName := current.Labels[pipeline.PipelineLabelKey]
+		if pipelineName != "" {
+			if pipelineName == targetPipelineName {
+				return fmt.Errorf(
+					"detected cycle in pipeline-in-pipeline: pipeline %q is already running in ancestor chain %v",
+					targetPipelineName, visited,
+				)
+			}
+			visited = append(visited, pipelineName)
+		}
 
-// collectPipelineRefDeps recursively walks a PipelineSpec and adds any PipelineRef
-// dependencies to the deps map for cycle detection.
-func collectPipelineRefDeps(pipelineName string, spec *v1.PipelineSpec, deps map[string][]string) {
-	for _, task := range spec.Tasks {
-		if task.PipelineRef != nil && task.PipelineRef.Name != "" {
-			deps[pipelineName] = append(deps[pipelineName], task.PipelineRef.Name)
+		// Find PipelineRun owner
+		ownerRef := metav1.GetControllerOf(current)
+		if ownerRef == nil || ownerRef.Kind != "PipelineRun" {
+			break
 		}
-		if task.PipelineSpec != nil {
-			// For inline PipelineSpecs, check their tasks too (using the parent pipeline name
-			// since inline specs don't have their own name).
-			collectPipelineRefDeps(pipelineName, task.PipelineSpec, deps)
+
+		parent, err := c.pipelineRunLister.PipelineRuns(current.Namespace).Get(ownerRef.Name)
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				logger.Warnf("Could not look up parent PipelineRun %s for cycle detection: %v", ownerRef.Name, err)
+			}
+			break
 		}
+		current = parent
 	}
-	for _, task := range spec.Finally {
-		if task.PipelineRef != nil && task.PipelineRef.Name != "" {
-			deps[pipelineName] = append(deps[pipelineName], task.PipelineRef.Name)
-		}
-		if task.PipelineSpec != nil {
-			collectPipelineRefDeps(pipelineName, task.PipelineSpec, deps)
-		}
-	}
+	return nil
 }
 
 func (c *Reconciler) createTaskRuns(ctx context.Context, rpt *resources.ResolvedPipelineTask, pr *v1.PipelineRun, facts *resources.PipelineRunFacts) ([]*v1.TaskRun, error) {
