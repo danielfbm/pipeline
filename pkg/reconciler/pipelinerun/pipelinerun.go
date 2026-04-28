@@ -1098,10 +1098,11 @@ func (c *Reconciler) createChildPipelineRun(
 
 	// For PipelineRef tasks, detect and prevent pipeline-in-pipeline cycles
 	// by walking up the ownerReferences chain and checking tekton.dev/pipeline labels.
+	// detectPipelineRefCycle classifies its own errors: a real cycle is permanent,
+	// a transient lister failure stays retryable.
 	if rpt.PipelineTask.PipelineRef != nil && rpt.ResolvedPipeline.PipelineName != "" {
-		targetPipelineName := rpt.ResolvedPipeline.PipelineName
-		if err := c.detectPipelineRefCycle(ctx, pr, targetPipelineName); err != nil {
-			return nil, controller.NewPermanentError(err)
+		if err := c.detectPipelineRefCycle(ctx, pr, rpt.ResolvedPipeline.PipelineName); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1177,9 +1178,10 @@ func (c *Reconciler) getChildPipelineRunWorkspaces(ctx context.Context, pr *v1.P
 		}
 		b, hasBinding := parentWorkspaces[parentName]
 		if !hasBinding {
-			// TODO: Add non-optional workspace verification for unbound workspaces like tasks
-			// this would raise an error in the parent PipelineRun. Current implementation
-			// will raise the error in the child PipelineRun.
+			// Tracking parent-side validation of non-optional child workspaces:
+			// https://github.com/tektoncd/pipeline/issues/9924 (TEP-0056).
+			// Today, missing non-optional child workspaces fail the child PipelineRun
+			// rather than the parent.
 			continue
 		}
 		if b.PersistentVolumeClaim != nil || b.VolumeClaimTemplate != nil {
@@ -1204,17 +1206,19 @@ func (c *Reconciler) getChildPipelineRunWorkspaces(ctx context.Context, pr *v1.P
 
 // detectPipelineRefCycle walks up the ownerReferences chain from the current PipelineRun
 // and checks the tekton.dev/pipeline label at each level. If the target pipeline name
-// appears in any ancestor, a cycle is detected.
+// appears in any ancestor, a cycle is detected and a permanent error is returned. A
+// transient lister failure during the walk is returned unwrapped so the caller can
+// retry rather than fail the PipelineRun permanently.
 func (c *Reconciler) detectPipelineRefCycle(ctx context.Context, pr *v1.PipelineRun, targetPipelineName string) error {
 	current := pr
 	var visited []string
 	for {
 		pipelineName := current.Labels[pipeline.PipelineLabelKey]
 		if pipelineName == targetPipelineName {
-			return fmt.Errorf(
+			return controller.NewPermanentError(fmt.Errorf(
 				"detected cycle in pipeline-in-pipeline: pipeline %q is already running in ancestor chain %v",
 				targetPipelineName, visited,
-			)
+			))
 		}
 		if pipelineName != "" {
 			visited = append(visited, pipelineName)
