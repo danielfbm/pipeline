@@ -781,11 +781,8 @@ func (t *ResolvedPipelineTask) setChildPipelineRunsAndResolvedPipeline(
 		return fmt.Errorf("PipelineTask %q must specify one of PipelineRef or PipelineSpec", pipelineTask.Name)
 	}
 
-	rp := ResolvedPipeline{}
-
 	if pipelineTask.PipelineSpec != nil {
-		rp.PipelineSpec = pipelineTask.PipelineSpec
-		t.ResolvedPipeline = rp
+		t.ResolvedPipeline = ResolvedPipeline{PipelineSpec: pipelineTask.PipelineSpec}
 		return nil
 	}
 
@@ -806,9 +803,10 @@ func (t *ResolvedPipelineTask) setChildPipelineRunsAndResolvedPipeline(
 	}
 
 	spec := p.Spec
-	rp.PipelineSpec = &spec
-	rp.PipelineName = p.Name
-	t.ResolvedPipeline = rp
+	t.ResolvedPipeline = ResolvedPipeline{
+		PipelineSpec: &spec,
+		PipelineName: p.Name,
+	}
 	return nil
 }
 

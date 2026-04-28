@@ -1114,40 +1114,9 @@ func (c *Reconciler) createChildPipelineRun(
 		childLabels[pipeline.PipelineLabelKey] = rpt.ResolvedPipeline.PipelineName
 	}
 
-	// Map workspace bindings from the parent PipelineRun to the child PipelineRun
-	// based on the PipelineTask workspace mappings.
-	var pipelinePVCWorkspaceName string
-	var childWorkspaces []v1.WorkspaceBinding
-	if len(rpt.PipelineTask.Workspaces) > 0 {
-		parentWorkspaces := make(map[string]v1.WorkspaceBinding)
-		for _, binding := range pr.Spec.Workspaces {
-			parentWorkspaces[binding.Name] = binding
-		}
-		for _, ws := range rpt.PipelineTask.Workspaces {
-			childPipelineWorkspaceName, childPipelineSubPath, pipelineWorkspaceName := ws.Name, ws.SubPath, ws.Workspace
-			parentName := pipelineWorkspaceName
-			if parentName == "" {
-				parentName = childPipelineWorkspaceName
-			}
-			if b, hasBinding := parentWorkspaces[parentName]; hasBinding {
-				if b.PersistentVolumeClaim != nil || b.VolumeClaimTemplate != nil {
-					pipelinePVCWorkspaceName = parentName
-				}
-
-				aaBehavior, err := affinityassistant.GetAffinityAssistantBehavior(ctx)
-				if err != nil {
-					return nil, err
-				}
-
-				// Reuses the task workspace binding logic which already
-				// cover cases PVC, VolumeTemplates which is identical in this case
-				workspace := c.taskWorkspaceByWorkspaceVolumeSource(ctx, pipelinePVCWorkspaceName, pr.Name, b, childPipelineWorkspaceName, childPipelineSubPath, *kmeta.NewControllerRef(pr), aaBehavior)
-				childWorkspaces = append(childWorkspaces, workspace)
-			}
-			// TODO: Add non-optional workspace verification for unbound workspaces like tasks
-			// this would raise an error in the parent PipelineRun. Current implementation
-			// will raise the error in the child PipelineRun.
-		}
+	childWorkspaces, err := c.getChildPipelineRunWorkspaces(ctx, pr, rpt)
+	if err != nil {
+		return nil, err
 	}
 
 	childSpec := v1.PipelineRunSpec{
@@ -1183,22 +1152,71 @@ func (c *Reconciler) createChildPipelineRun(
 		Create(ctx, newChildPipelineRun, metav1.CreateOptions{})
 }
 
+// getChildPipelineRunWorkspaces resolves workspace bindings from the parent PipelineRun
+// for the given PipelineTask that references a child Pipeline. It reuses the same volume
+// source handling as TaskRun workspaces.
+func (c *Reconciler) getChildPipelineRunWorkspaces(ctx context.Context, pr *v1.PipelineRun, rpt *resources.ResolvedPipelineTask) ([]v1.WorkspaceBinding, error) {
+	if len(rpt.PipelineTask.Workspaces) == 0 {
+		return nil, nil
+	}
+
+	parentWorkspaces := make(map[string]v1.WorkspaceBinding, len(pr.Spec.Workspaces))
+	for _, binding := range pr.Spec.Workspaces {
+		parentWorkspaces[binding.Name] = binding
+	}
+
+	var (
+		pipelinePVCWorkspaceName string
+		childWorkspaces          []v1.WorkspaceBinding
+	)
+	for _, ws := range rpt.PipelineTask.Workspaces {
+		childPipelineWorkspaceName, childPipelineSubPath, pipelineWorkspaceName := ws.Name, ws.SubPath, ws.Workspace
+		parentName := pipelineWorkspaceName
+		if parentName == "" {
+			parentName = childPipelineWorkspaceName
+		}
+		b, hasBinding := parentWorkspaces[parentName]
+		if !hasBinding {
+			// TODO: Add non-optional workspace verification for unbound workspaces like tasks
+			// this would raise an error in the parent PipelineRun. Current implementation
+			// will raise the error in the child PipelineRun.
+			continue
+		}
+		if b.PersistentVolumeClaim != nil || b.VolumeClaimTemplate != nil {
+			pipelinePVCWorkspaceName = parentName
+		}
+
+		aaBehavior, err := affinityassistant.GetAffinityAssistantBehavior(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		// Reuses the task workspace binding logic which already
+		// cover cases PVC, VolumeTemplates which is identical in this case
+		childWorkspaces = append(childWorkspaces, c.taskWorkspaceByWorkspaceVolumeSource(
+			ctx, pipelinePVCWorkspaceName, pr.Name, b,
+			childPipelineWorkspaceName, childPipelineSubPath,
+			*kmeta.NewControllerRef(pr), aaBehavior,
+		))
+	}
+	return childWorkspaces, nil
+}
+
 // detectPipelineRefCycle walks up the ownerReferences chain from the current PipelineRun
 // and checks the tekton.dev/pipeline label at each level. If the target pipeline name
 // appears in any ancestor, a cycle is detected.
 func (c *Reconciler) detectPipelineRefCycle(ctx context.Context, pr *v1.PipelineRun, targetPipelineName string) error {
-	logger := logging.FromContext(ctx)
 	current := pr
 	var visited []string
 	for {
 		pipelineName := current.Labels[pipeline.PipelineLabelKey]
+		if pipelineName == targetPipelineName {
+			return fmt.Errorf(
+				"detected cycle in pipeline-in-pipeline: pipeline %q is already running in ancestor chain %v",
+				targetPipelineName, visited,
+			)
+		}
 		if pipelineName != "" {
-			if pipelineName == targetPipelineName {
-				return fmt.Errorf(
-					"detected cycle in pipeline-in-pipeline: pipeline %q is already running in ancestor chain %v",
-					targetPipelineName, visited,
-				)
-			}
 			visited = append(visited, pipelineName)
 		}
 
@@ -1210,10 +1228,10 @@ func (c *Reconciler) detectPipelineRefCycle(ctx context.Context, pr *v1.Pipeline
 
 		parent, err := c.pipelineRunLister.PipelineRuns(current.Namespace).Get(ownerRef.Name)
 		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				logger.Warnf("Could not look up parent PipelineRun %s for cycle detection: %v", ownerRef.Name, err)
+			if apierrors.IsNotFound(err) {
+				break
 			}
-			break
+			return fmt.Errorf("cycle detection in pipeline-in-pipeline: could not look up parent PipelineRun %s: %w", ownerRef.Name, err)
 		}
 		current = parent
 	}
