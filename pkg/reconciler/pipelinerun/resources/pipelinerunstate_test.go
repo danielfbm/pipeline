@@ -3747,6 +3747,164 @@ func TestPipelineRunState_GetResultsFuncs(t *testing.T) {
 	}
 }
 
+func TestGetChildPipelineRunResults(t *testing.T) {
+	successfulChildPipeline := &ResolvedPipelineTask{
+		ChildPipelineRunNames: []string{"successful-child-pipeline"},
+		PipelineTask: &v1.PipelineTask{
+			Name:        "successful-child-pipeline-1",
+			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+		},
+		ChildPipelineRuns: []*v1.PipelineRun{{
+			Status: v1.PipelineRunStatus{
+				Status: duckv1.Status{Conditions: []apis.Condition{{
+					Type:   apis.ConditionSucceeded,
+					Status: corev1.ConditionTrue,
+				}}},
+				PipelineRunStatusFields: v1.PipelineRunStatusFields{
+					Results: []v1.PipelineRunResult{{
+						Name:  "foo",
+						Value: *v1.NewStructuredValues("oof"),
+					}, {
+						Name:  "bar",
+						Value: *v1.NewStructuredValues("rab"),
+					}},
+				},
+			},
+		}},
+	}
+	failedChildPipeline := &ResolvedPipelineTask{
+		ChildPipelineRunNames: []string{"failed-child-pipeline"},
+		PipelineTask: &v1.PipelineTask{
+			Name:        "failed-child-pipeline-1",
+			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+		},
+		ChildPipelineRuns: []*v1.PipelineRun{{
+			Status: v1.PipelineRunStatus{
+				Status: duckv1.Status{Conditions: []apis.Condition{{
+					Type:   apis.ConditionSucceeded,
+					Status: corev1.ConditionFalse,
+				}}},
+				PipelineRunStatusFields: v1.PipelineRunStatusFields{
+					Results: []v1.PipelineRunResult{{
+						Name:  "fail-foo",
+						Value: *v1.NewStructuredValues("fail-oof"),
+					}},
+				},
+			},
+		}},
+	}
+	runningChildPipeline := &ResolvedPipelineTask{
+		ChildPipelineRunNames: []string{"running-child-pipeline"},
+		PipelineTask: &v1.PipelineTask{
+			Name:        "running-child-pipeline-1",
+			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+		},
+		ChildPipelineRuns: []*v1.PipelineRun{{
+			Status: v1.PipelineRunStatus{
+				Status: duckv1.Status{Conditions: []apis.Condition{{
+					Type:   apis.ConditionSucceeded,
+					Status: corev1.ConditionUnknown,
+				}}},
+			},
+		}},
+	}
+	notStartedChildPipeline := &ResolvedPipelineTask{
+		ChildPipelineRunNames: []string{"not-started-child-pipeline"},
+		PipelineTask: &v1.PipelineTask{
+			Name:        "not-started-child-pipeline-1",
+			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+		},
+	}
+	successfulTaskRun := &ResolvedPipelineTask{
+		TaskRunNames: []string{"successful-task"},
+		PipelineTask: &v1.PipelineTask{
+			Name:    "successful-task-1",
+			TaskRef: &v1.TaskRef{Name: "task"},
+		},
+		TaskRuns: []*v1.TaskRun{{
+			Status: v1.TaskRunStatus{
+				Status: duckv1.Status{Conditions: []apis.Condition{{
+					Type:   apis.ConditionSucceeded,
+					Status: corev1.ConditionTrue,
+				}}},
+				TaskRunStatusFields: v1.TaskRunStatusFields{
+					Results: []v1.TaskRunResult{{
+						Name:  "foo",
+						Value: *v1.NewStructuredValues("oof"),
+					}},
+				},
+			},
+		}},
+	}
+
+	testCases := []struct {
+		name     string
+		state    PipelineRunState
+		expected map[string][]v1.PipelineRunResult
+	}{{
+		name:     "empty-state",
+		state:    PipelineRunState{},
+		expected: map[string][]v1.PipelineRunResult{},
+	}, {
+		name:     "taskrun-backed-tasks-are-excluded",
+		state:    PipelineRunState{successfulTaskRun},
+		expected: map[string][]v1.PipelineRunResult{},
+	}, {
+		name:  "successful-child-pipeline-included",
+		state: PipelineRunState{successfulChildPipeline},
+		expected: map[string][]v1.PipelineRunResult{
+			"successful-child-pipeline-1": {{
+				Name:  "foo",
+				Value: *v1.NewStructuredValues("oof"),
+			}, {
+				Name:  "bar",
+				Value: *v1.NewStructuredValues("rab"),
+			}},
+		},
+	}, {
+		name:  "failed-child-pipeline-included",
+		state: PipelineRunState{failedChildPipeline},
+		expected: map[string][]v1.PipelineRunResult{
+			"failed-child-pipeline-1": {{
+				Name:  "fail-foo",
+				Value: *v1.NewStructuredValues("fail-oof"),
+			}},
+		},
+	}, {
+		name:     "running-child-pipeline-excluded",
+		state:    PipelineRunState{runningChildPipeline},
+		expected: map[string][]v1.PipelineRunResult{},
+	}, {
+		name:     "not-started-child-pipeline-excluded",
+		state:    PipelineRunState{notStartedChildPipeline},
+		expected: map[string][]v1.PipelineRunResult{},
+	}, {
+		name:  "mixed-state",
+		state: PipelineRunState{successfulTaskRun, successfulChildPipeline, failedChildPipeline, runningChildPipeline, notStartedChildPipeline},
+		expected: map[string][]v1.PipelineRunResult{
+			"successful-child-pipeline-1": {{
+				Name:  "foo",
+				Value: *v1.NewStructuredValues("oof"),
+			}, {
+				Name:  "bar",
+				Value: *v1.NewStructuredValues("rab"),
+			}},
+			"failed-child-pipeline-1": {{
+				Name:  "fail-foo",
+				Value: *v1.NewStructuredValues("fail-oof"),
+			}},
+		},
+	}}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := tc.state.GetChildPipelineRunResults()
+			if d := cmp.Diff(tc.expected, actual); d != "" {
+				t.Errorf("Didn't get expected child PipelineRun results map: %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
 func TestPipelineRunState_GetTaskRunsArtifacts(t *testing.T) {
 	testCases := []struct {
 		name              string

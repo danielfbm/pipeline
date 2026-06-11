@@ -72,6 +72,17 @@ func validateResultRef(ref *v1.ResultRef, ptMap map[string]*ResolvedPipelineTask
 		// custom task executes.
 		return nil
 	}
+	if rpt := ptMap[ref.PipelineTask]; rpt.IsChildPipeline() {
+		if rpt.ResolvedPipeline.PipelineSpec == nil {
+			return fmt.Errorf("unable to validate result referencing pipeline task %q: pipeline spec not found", ref.PipelineTask)
+		}
+		for _, pipelineResult := range rpt.ResolvedPipeline.PipelineSpec.Results {
+			if pipelineResult.Name == ref.Result {
+				return nil
+			}
+		}
+		return fmt.Errorf("%q is not a named result returned by pipeline task %q", ref.Result, ref.PipelineTask)
+	}
 	if ptMap[ref.PipelineTask].ResolvedTask == nil || ptMap[ref.PipelineTask].ResolvedTask.TaskSpec == nil {
 		return fmt.Errorf("unable to validate result referencing pipeline task %q: task spec not found", ref.PipelineTask)
 	}

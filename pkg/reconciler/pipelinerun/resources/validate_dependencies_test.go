@@ -477,3 +477,74 @@ func TestValidateOptionalWorkspaces_NonOptionalTaskWorkspace(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// TestValidateResultRef_ChildPipeline tests validation of result references whose
+// target PipelineTask is a child Pipeline (pipelineRef/pipelineSpec): the reference
+// is checked against the resolved child Pipeline's declared results.
+func TestValidateResultRef_ChildPipeline(t *testing.T) {
+	childPipelineTask := func(spec *v1.PipelineSpec) *prresources.ResolvedPipelineTask {
+		return &prresources.ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				Name:        "child",
+				PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+			},
+			ResolvedPipeline: prresources.ResolvedPipeline{PipelineSpec: spec},
+		}
+	}
+	consumer := &prresources.ResolvedPipelineTask{
+		PipelineTask: &v1.PipelineTask{
+			Name: "consumer",
+			Params: []v1.Param{{
+				Name:  "p",
+				Value: *v1.NewStructuredValues("$(tasks.child.results.message)"),
+			}},
+		},
+	}
+	specWithResult := &v1.PipelineSpec{
+		Results: []v1.PipelineResult{{
+			Name:  "message",
+			Value: *v1.NewStructuredValues("$(tasks.t.results.message)"),
+		}},
+	}
+
+	for _, tc := range []struct {
+		desc    string
+		state   prresources.PipelineRunState
+		wantErr string
+	}{{
+		desc:  "result declared by the child pipeline",
+		state: prresources.PipelineRunState{childPipelineTask(specWithResult), consumer},
+	}, {
+		desc:    "result not declared by the child pipeline",
+		state:   prresources.PipelineRunState{childPipelineTask(&v1.PipelineSpec{}), consumer},
+		wantErr: `"message" is not a named result returned by pipeline task "child"`,
+	}, {
+		desc:    "child pipeline spec not resolved",
+		state:   prresources.PipelineRunState{childPipelineTask(nil), consumer},
+		wantErr: `unable to validate result referencing pipeline task "child": pipeline spec not found`,
+	}} {
+		t.Run(tc.desc, func(t *testing.T) {
+			err := prresources.ValidatePipelineTaskResults(tc.state)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("expected error containing %q, got: %v", tc.wantErr, err)
+			}
+		})
+	}
+
+	t.Run("pipeline result referencing a child pipeline result", func(t *testing.T) {
+		ps := &v1.PipelineSpec{
+			Results: []v1.PipelineResult{{
+				Name:  "parent-message",
+				Value: *v1.NewStructuredValues("$(tasks.child.results.message)"),
+			}},
+		}
+		state := prresources.PipelineRunState{childPipelineTask(specWithResult)}
+		if err := prresources.ValidatePipelineResults(ps, state); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}

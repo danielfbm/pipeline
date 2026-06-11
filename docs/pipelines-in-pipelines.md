@@ -12,6 +12,7 @@ weight: 406
 - [Specifying `pipelineSpec` in `Tasks`](#specifying-pipelinespec-in-pipelinetasks)
 - [Specifying `Parameters`](#specifying-parameters)
 - [Specifying `Workspaces`](#specifying-workspaces)
+- [Consuming `Results` from child `Pipelines`](#consuming-results-from-child-pipelines)
 - [Known Limitations](#known-limitations)
 
 ## Overview
@@ -161,13 +162,55 @@ spec:
         name: security-scans
 ```
 
+## Consuming `Results` from child `Pipelines`
+
+`Results` produced by a child `Pipeline` (declared under its `results` and surfaced on the child `PipelineRun`'s `status.results`) propagate to the parent in the same way as `Task` results:
+
+- Subsequent `PipelineTasks` (including `finally` tasks) can consume them in `params` and `when` expressions via `$(tasks.<pipelineTaskName>.results.<resultName>)`.
+- The parent `Pipeline` can emit them as its own `results`, which are then aggregated into the parent `PipelineRun`'s `status.results`.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: security-scans
+spec:
+  tasks:
+    - name: scorecards
+      taskRef:
+        name: scorecards
+  results:
+    - name: scan-status
+      value: $(tasks.scorecards.results.status)
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: clone-scan-notify
+spec:
+  tasks:
+    - name: security-scans
+      pipelineRef:
+        name: security-scans
+    - name: notification
+      params:
+        - name: message
+          value: "scan finished with status $(tasks.security-scans.results.scan-status)"
+      taskRef:
+        name: notification
+  results:
+    - name: scan-status
+      value: $(tasks.security-scans.results.scan-status)
+```
+
+String, array and object results are supported, matching the behavior of `Task` results. As with `Task` results, referencing a `Result` that the successfully completed child `Pipeline` did not produce fails the parent `PipelineRun`; the consuming `PipelineTask` is instead skipped in the cases where `Task` result consumers are skipped (for example a `finally` task, an `onError: continue` consumer, or when the child itself was skipped or failed).
+
 ## Known Limitations
 
 The initial alpha implementation has the following limitations. These are expected to be addressed in follow-up work.
 
 ### Other current limitations
 
-- `When` expressions in the parent `Pipeline` cannot reference results of a `PipelineTask` that uses `pipelineRef` or `pipelineSpec` (corollary of the result-propagation gap below).
 - Per-`PipelineTask` `timeout` and `retries` are not applied to the child `PipelineRun`. The child runs with its own default timeouts and is created at most once per parent reconcile.
 - The parent `PipelineRun.Spec.Timeouts` is not propagated to the child `PipelineRun`; the child uses its own defaults.
 - `pipelineRef` cycle detection is best-effort and runs at child reconcile time: it walks the `ownerReferences` chain and matches the `tekton.dev/pipeline` label, so cycles are caught when the offending child is reconciled rather than at parent submission.
@@ -175,16 +218,3 @@ The initial alpha implementation has the following limitations. These are expect
 - [Execution `Status`](https://github.com/tektoncd/community/blob/main/teps/0056-pipelines-in-pipelines.md#execution-status) of a `PipelineTask` that uses `pipelineRef` or `pipelineSpec` is not surfaced, so a `finally` task cannot branch on whether a child `Pipeline` succeeded, failed, or was skipped via `$(tasks.<pipelineTaskName>.status)`.
 - [`Matrix`](https://github.com/tektoncd/community/blob/main/teps/0056-pipelines-in-pipelines.md#matrix) fan-out of a `PipelineTask` that uses `pipelineRef` or `pipelineSpec` is not supported: such a task cannot be combined with a `matrix` to produce multiple child `PipelineRuns`.
 
-
-### Results from child Pipelines are not propagated
-
-`Results` produced by a child `Pipeline` are **not** surfaced on the parent `PipelineRun`:
-
-- They are not aggregated into the parent `PipelineRun`'s `status.results`.
-- They cannot be consumed by other `PipelineTasks` via `$(tasks.<task-name>.results.<result-name>)` or by `when` expressions in the parent.
-
-To enforce this at authoring time, the pipeline validating webhook rejects any result reference whose target is a `PipelineTask` using `pipelineRef` or `pipelineSpec`, with an error like:
-
-> `result reference to pipelineTask "child" is not supported: referenced task uses pipelineRef or pipelineSpec and result propagation from child Pipelines is not yet implemented`
-
-Until propagation is implemented, pass values into a child `Pipeline` through `params` on the `PipelineTask`, and keep the parent `Pipeline`'s `results` sourced from regular `TaskRun`s.

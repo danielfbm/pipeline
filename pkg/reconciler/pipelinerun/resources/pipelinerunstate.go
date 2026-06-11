@@ -203,6 +203,29 @@ func (state PipelineRunState) GetTaskRunsResults() map[string][]v1.TaskRunResult
 	return results
 }
 
+// GetChildPipelineRunResults returns a map of all completed child PipelineRuns in the state, with the pipeline
+// task name as the key and the results from the corresponding child PipelineRun as the value. It includes child
+// pipelines which have completed successfully or with failure (including cancelled and timed-out, see
+// GetTaskRunsResults comment).
+func (state PipelineRunState) GetChildPipelineRunResults() map[string][]v1.PipelineRunResult {
+	results := make(map[string][]v1.PipelineRunResult)
+	for _, rpt := range state {
+		if !rpt.IsChildPipeline() {
+			continue
+		}
+		if !rpt.isSuccessful() && !rpt.isFailure() {
+			continue
+		}
+		// A matrix cannot fan out a child Pipeline, so a completed child pipeline
+		// task always has exactly one child PipelineRun.
+		if len(rpt.ChildPipelineRuns) == 0 {
+			continue
+		}
+		results[rpt.PipelineTask.Name] = rpt.ChildPipelineRuns[0].Status.Results
+	}
+	return results
+}
+
 // GetTaskRunsArtifacts returns a map of all completed TaskRuns in the state, with the pipeline task name as
 // the key and the artifacts from the corresponding TaskRun as the value. It includes tasks which have completed
 // successfully or with failure (including cancelled and timed-out, see GetTaskRunsResults comment).

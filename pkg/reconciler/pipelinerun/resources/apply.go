@@ -714,15 +714,16 @@ func PropagateArtifacts(rpt *ResolvedPipelineTask, runStates PipelineRunState) e
 	return nil
 }
 
-// ApplyTaskResultsToPipelineResults applies the results of completed TasksRuns and Runs to a Pipeline's
-// list of PipelineResults, returning the computed set of PipelineRunResults. References to
-// non-existent TaskResults or failed TaskRuns or Runs result in a PipelineResult being considered invalid
-// and omitted from the returned slice. A nil slice is returned if no results are passed in or all
-// results are invalid.
+// ApplyTaskResultsToPipelineResults applies the results of completed TaskRuns, Runs and child
+// PipelineRuns to a Pipeline's list of PipelineResults, returning the computed set of
+// PipelineRunResults. References to non-existent TaskResults or failed TaskRuns, Runs or child
+// PipelineRuns result in a PipelineResult being considered invalid and omitted from the returned
+// slice. A nil slice is returned if no results are passed in or all results are invalid.
 func ApplyTaskResultsToPipelineResults(
 	results []v1.PipelineResult,
 	taskRunResults map[string][]v1.TaskRunResult,
 	customTaskResults map[string][]v1beta1.CustomRunResult,
+	childPipelineRunResults map[string][]v1.PipelineRunResult,
 	taskstatus map[string]string,
 ) ([]v1.PipelineRunResult, error) {
 	var runResults []v1.PipelineRunResult
@@ -761,7 +762,11 @@ func ApplyTaskResultsToPipelineResults(
 			case resultsParseNumber:
 				taskName, resultName := variableParts[1], variableParts[3]
 				resultName, stringIdx := v1.ParseResultName(resultName)
-				if resultValue := taskResultValue(taskName, resultName, taskRunResults); resultValue != nil {
+				resultValue := taskResultValue(taskName, resultName, taskRunResults)
+				if resultValue == nil {
+					resultValue = childPipelineRunResultValue(taskName, resultName, childPipelineRunResults)
+				}
+				if resultValue != nil {
 					switch resultValue.Type {
 					case v1.ParamTypeString:
 						stringReplacements[variable] = resultValue.StringVal
@@ -799,7 +804,11 @@ func ApplyTaskResultsToPipelineResults(
 			case objectElementResultsParseNumber:
 				taskName, resultName, objectKey := variableParts[1], variableParts[3], variableParts[4]
 				resultName, _ = v1.ParseResultName(resultName)
-				if resultValue := taskResultValue(taskName, resultName, taskRunResults); resultValue != nil {
+				resultValue := taskResultValue(taskName, resultName, taskRunResults)
+				if resultValue == nil {
+					resultValue = childPipelineRunResultValue(taskName, resultName, childPipelineRunResults)
+				}
+				if resultValue != nil {
 					if _, ok := resultValue.ObjectVal[objectKey]; ok {
 						stringReplacements[variable] = resultValue.ObjectVal[objectKey]
 					} else {
@@ -848,6 +857,18 @@ func taskResultValue(taskName string, resultName string, taskResults map[string]
 	for _, trResult := range taskResults[taskName] {
 		if trResult.Name == resultName {
 			return &trResult.Value
+		}
+	}
+	return nil
+}
+
+// childPipelineRunResultValue returns the result value for a given pipeline task name and result name in a map of
+// PipelineRunResults for pipeline task names. It returns nil if either the pipeline task name isn't present in the
+// map, or if there is no result with the result name in the pipeline task name's slice of results.
+func childPipelineRunResultValue(taskName string, resultName string, childPipelineRunResults map[string][]v1.PipelineRunResult) *v1.ResultValue {
+	for _, prResult := range childPipelineRunResults[taskName] {
+		if prResult.Name == resultName {
+			return &prResult.Value
 		}
 	}
 	return nil

@@ -6326,3 +6326,91 @@ func TestSetChildPipelineRunsAndResolvedPipeline(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckMissingResultReferencesChildPipeline(t *testing.T) {
+	newChildPipelineTask := func(condition apis.Condition, results []v1.PipelineRunResult) *ResolvedPipelineTask {
+		return &ResolvedPipelineTask{
+			ChildPipelineRunNames: []string{"child-pipelinerun"},
+			ChildPipelineRuns: []*v1.PipelineRun{{
+				ObjectMeta: metav1.ObjectMeta{Name: "child-pipelinerun"},
+				Status: v1.PipelineRunStatus{
+					Status: duckv1.Status{
+						Conditions: duckv1.Conditions{condition},
+					},
+					PipelineRunStatusFields: v1.PipelineRunStatusFields{
+						Results: results,
+					},
+				},
+			}},
+			PipelineTask: &v1.PipelineTask{
+				Name:        "child-pipeline-task",
+				PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+			},
+		}
+	}
+	target := &ResolvedPipelineTask{
+		PipelineTask: &v1.PipelineTask{
+			Name:    "consumer",
+			TaskRef: &v1.TaskRef{Name: "consumer-task"},
+			Params: []v1.Param{{
+				Name:  "input",
+				Value: *v1.NewStructuredValues("$(tasks.child-pipeline-task.results.expected-result)"),
+			}},
+		},
+	}
+	succeededCondition := apis.Condition{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}
+	notSucceededCondition := apis.Condition{Type: apis.ConditionSucceeded, Status: corev1.ConditionFalse}
+
+	for _, tc := range []struct {
+		name                  string
+		referenced            *ResolvedPipelineTask
+		wantErr               string
+		wantMissingResultType bool
+	}{{
+		name: "child pipeline with result present",
+		referenced: newChildPipelineTask(succeededCondition, []v1.PipelineRunResult{{
+			Name:  "expected-result",
+			Value: *v1.NewStructuredValues("some-value"),
+		}}),
+	}, {
+		name:                  "successful child missing the named result",
+		referenced:            newChildPipelineTask(succeededCondition, nil),
+		wantErr:               `task "child-pipeline-task" completed successfully but did not emit the result "expected-result", which is referenced by task "consumer"`,
+		wantMissingResultType: true,
+	}, {
+		name:       "failed child missing the named result",
+		referenced: newChildPipelineTask(notSucceededCondition, nil),
+		wantErr:    "Invalid task result reference: Could not find result with name expected-result for pipeline task child-pipeline-task",
+	}, {
+		name: "zero-length ChildPipelineRuns",
+		referenced: &ResolvedPipelineTask{
+			ChildPipelineRunNames: []string{"child-pipelinerun"},
+			ChildPipelineRuns:     []*v1.PipelineRun{},
+			PipelineTask: &v1.PipelineTask{
+				Name:        "child-pipeline-task",
+				PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+			},
+		},
+		wantErr: `Result reference error: Internal result ref "child-pipeline-task" has zero-length ChildPipelineRuns`,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckMissingResultReferences(PipelineRunState{tc.referenced, target}, target)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("CheckMissingResultReferences() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("CheckMissingResultReferences() expected error %q but got nil", tc.wantErr)
+			}
+			if err.Error() != tc.wantErr {
+				t.Errorf("CheckMissingResultReferences() error = %q, want %q", err.Error(), tc.wantErr)
+			}
+			var missingResultErr *MissingResultFromCompletedTaskError
+			if gotType := errors.As(err, &missingResultErr); gotType != tc.wantMissingResultType {
+				t.Errorf("errors.As(err, *MissingResultFromCompletedTaskError) = %t, want %t (err: %v)", gotType, tc.wantMissingResultType, err)
+			}
+		})
+	}
+}

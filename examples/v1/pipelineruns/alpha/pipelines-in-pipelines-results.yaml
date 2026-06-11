@@ -1,0 +1,61 @@
+# Pipelines-in-Pipelines results propagation example: a child Pipeline emits
+# a result, a later task in the parent consumes it via
+# $(tasks.<name>.results.<result>), and the parent Pipeline re-emits it as its
+# own result so it lands on the parent PipelineRun's status.results.
+# Requires the alpha feature flag (enable-api-fields: alpha).
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: child-pipeline-with-results
+spec:
+  description: A child Pipeline that produces a result.
+  tasks:
+    - name: produce
+      taskSpec:
+        results:
+          - name: message
+        steps:
+          - name: write
+            image: mirror.gcr.io/busybox
+            script: 'printf "hello-from-child" > $(results.message.path)'
+  results:
+    - name: message
+      value: $(tasks.produce.results.message)
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: pipelines-in-pipelines-results
+spec:
+  description: Run a child Pipeline and consume its propagated result.
+  tasks:
+    - name: child
+      pipelineRef:
+        name: child-pipeline-with-results
+    - name: consume
+      params:
+        - name: message
+          value: $(tasks.child.results.message)
+      when:
+        - input: $(tasks.child.results.message)
+          operator: in
+          values: ["hello-from-child"]
+      taskSpec:
+        params:
+          - name: message
+        steps:
+          - name: check
+            image: mirror.gcr.io/busybox
+            script: |
+              test "$(params.message)" = "hello-from-child"
+  results:
+    - name: child-message
+      value: $(tasks.child.results.message)
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: pipelines-in-pipelines-results-run-
+spec:
+  pipelineRef:
+    name: pipelines-in-pipelines-results
