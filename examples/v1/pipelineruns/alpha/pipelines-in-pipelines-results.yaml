@@ -1,0 +1,56 @@
+# Pipelines-in-Pipelines example: a child Pipeline declares a result that the
+# parent Pipeline consumes in a task param and surfaces as one of its own
+# results, aggregating it into the parent PipelineRun's status.results.
+# Requires the alpha feature flag (enable-api-fields: alpha) to be set on the
+# cluster.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: child-pipeline-with-result
+spec:
+  description: A child Pipeline that reports a result to its caller.
+  results:
+    - name: message
+      value: $(tasks.produce.results.message)
+  tasks:
+    - name: produce
+      taskSpec:
+        results:
+          - name: message
+        steps:
+          - name: produce
+            image: mirror.gcr.io/busybox
+            script: 'printf "hello from the child Pipeline" > $(results.message.path)'
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: pipelines-in-pipelines-results
+spec:
+  description: Consume the child Pipeline's result in a task and as a pipeline result.
+  results:
+    - name: child-message
+      value: $(tasks.child.results.message)
+  tasks:
+    - name: child
+      pipelineRef:
+        name: child-pipeline-with-result
+    - name: consume
+      params:
+        - name: message
+          value: $(tasks.child.results.message)
+      taskSpec:
+        params:
+          - name: message
+        steps:
+          - name: echo
+            image: mirror.gcr.io/busybox
+            script: 'echo "received: $(params.message)"'
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: pipelines-in-pipelines-results-run-
+spec:
+  pipelineRef:
+    name: pipelines-in-pipelines-results

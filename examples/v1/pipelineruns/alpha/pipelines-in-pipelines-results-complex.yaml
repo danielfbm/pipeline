@@ -1,0 +1,117 @@
+# Pipelines-in-Pipelines example: a child Pipeline reports string, array and
+# object results. The parent consumes them in params (whole array, array
+# index, object key), gates a task with a when expression on the child's
+# string result, lets a finally task consume the child result, and surfaces
+# all of them as parent results in status.results. Requires the alpha feature
+# flag (enable-api-fields: alpha) to be set on the cluster.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: child-pipeline-many-results
+spec:
+  description: A child Pipeline that reports string, array and object results.
+  results:
+    - name: branch
+      value: $(tasks.produce.results.branch)
+    - name: platforms
+      type: array
+      value: $(tasks.produce.results.platforms[*])
+    - name: image
+      type: object
+      value: $(tasks.produce.results.image[*])
+  tasks:
+    - name: produce
+      taskSpec:
+        results:
+          - name: branch
+          - name: platforms
+            type: array
+          - name: image
+            type: object
+            properties:
+              url:
+                type: string
+              digest:
+                type: string
+        steps:
+          - name: produce
+            image: mirror.gcr.io/busybox
+            script: |
+              printf "main" > $(results.branch.path)
+              printf '["linux/amd64","linux/arm64"]' > $(results.platforms.path)
+              printf '{"url":"example.com/repo/image","digest":"sha256:deadbeef"}' > $(results.image.path)
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: pipelines-in-pipelines-results-complex
+spec:
+  description: |
+    Consume string, array and object results of a child Pipeline in params,
+    when expressions, finally tasks and pipeline results.
+  results:
+    - name: branch
+      value: $(tasks.child.results.branch)
+    - name: first-platform
+      value: $(tasks.child.results.platforms[0])
+    - name: image-url
+      value: $(tasks.child.results.image.url)
+  tasks:
+    - name: child
+      pipelineRef:
+        name: child-pipeline-many-results
+    - name: consume
+      when:
+        - input: $(tasks.child.results.branch)
+          operator: in
+          values: ["main"]
+      params:
+        - name: platforms
+          value: $(tasks.child.results.platforms[*])
+        - name: digest
+          value: $(tasks.child.results.image.digest)
+      taskSpec:
+        params:
+          - name: platforms
+            type: array
+          - name: digest
+        steps:
+          - name: echo
+            image: mirror.gcr.io/busybox
+            args: ["$(params.platforms[*])"]
+            script: |
+              #!/bin/sh
+              echo "digest: $(params.digest)"
+              for p in "$@"; do
+                echo "platform: $p"
+              done
+    - name: skipped-on-branch
+      when:
+        - input: $(tasks.child.results.branch)
+          operator: notin
+          values: ["main"]
+      taskSpec:
+        steps:
+          - name: echo
+            image: mirror.gcr.io/busybox
+            script: 'echo "only runs off main"'
+  finally:
+    - name: report
+      params:
+        - name: branch
+          value: $(tasks.child.results.branch)
+      taskSpec:
+        params:
+          - name: branch
+        steps:
+          - name: echo
+            image: mirror.gcr.io/busybox
+            script: 'echo "finally saw branch $(params.branch)"'
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: pipelines-in-pipelines-results-complex-run-
+spec:
+  pipelineRef:
+    name: pipelines-in-pipelines-results-complex

@@ -3747,6 +3747,167 @@ func TestPipelineRunState_GetResultsFuncs(t *testing.T) {
 	}
 }
 
+func TestGetChildPipelineRunResults(t *testing.T) {
+	childPipelineTask := func(name string, childPipelineRuns ...*v1.PipelineRun) *ResolvedPipelineTask {
+		return &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				Name: name,
+				PipelineSpec: &v1.PipelineSpec{
+					Tasks: []v1.PipelineTask{{Name: "pip-child"}},
+				},
+			},
+			ChildPipelineRunNames: []string{name},
+			ChildPipelineRuns:     childPipelineRuns,
+		}
+	}
+	withPipelineRunResults := func(pr *v1.PipelineRun, results ...v1.PipelineRunResult) *v1.PipelineRun {
+		pr.Status.Results = results
+		return pr
+	}
+
+	successfulTask := &ResolvedPipelineTask{
+		PipelineTask: &v1.PipelineTask{
+			Name:    "successful-task",
+			TaskRef: &v1.TaskRef{Name: "task"},
+		},
+		TaskRunNames: []string{"successful-task"},
+		TaskRuns:     []*v1.TaskRun{makeSucceeded(trs[0])},
+	}
+	successfulCustomTask := &ResolvedPipelineTask{
+		PipelineTask: &v1.PipelineTask{
+			Name: "successful-custom-task",
+			TaskRef: &v1.TaskRef{
+				Kind:       "Example",
+				APIVersion: "example.dev/v0",
+			},
+		},
+		CustomRunNames: []string{"successful-custom-task"},
+		CustomRuns:     []*v1beta1.CustomRun{makeCustomRunSucceeded(customRuns[0])},
+		CustomTask:     true,
+	}
+
+	stringResult := v1.PipelineRunResult{
+		Name:  "string-result",
+		Value: *v1.NewStructuredValues("string-value"),
+	}
+	arrayResult := v1.PipelineRunResult{
+		Name:  "array-result",
+		Value: *v1.NewStructuredValues("array-value-one", "array-value-two"),
+	}
+	objectResult := v1.PipelineRunResult{
+		Name: "object-result",
+		Value: v1.ParamValue{
+			Type:      v1.ParamTypeObject,
+			ObjectVal: map[string]string{"key1": "value1", "key2": "value2"},
+		},
+	}
+	failedResult := v1.PipelineRunResult{
+		Name:  "fail-result",
+		Value: *v1.NewStructuredValues("fail-value"),
+	}
+
+	tcs := []struct {
+		name            string
+		state           PipelineRunState
+		expectedResults map[string][]v1.TaskRunResult
+	}{{
+		name:            "empty state",
+		state:           PipelineRunState{},
+		expectedResults: map[string][]v1.TaskRunResult{},
+	}, {
+		name:            "no child pipelines",
+		state:           PipelineRunState{successfulTask, successfulCustomTask},
+		expectedResults: map[string][]v1.TaskRunResult{},
+	}, {
+		name: "successful child pipeline with string, array and object results",
+		state: PipelineRunState{
+			childPipelineTask("successful-child-pipeline",
+				withPipelineRunResults(makePipelineRunSucceeded(prs[0]), stringResult, arrayResult, objectResult)),
+		},
+		expectedResults: map[string][]v1.TaskRunResult{
+			// Results keep the order in which the child PipelineRun reported them.
+			"successful-child-pipeline": {{
+				Name:  "string-result",
+				Type:  v1.ResultsTypeString,
+				Value: *v1.NewStructuredValues("string-value"),
+			}, {
+				Name:  "array-result",
+				Type:  v1.ResultsTypeArray,
+				Value: *v1.NewStructuredValues("array-value-one", "array-value-two"),
+			}, {
+				Name: "object-result",
+				Type: v1.ResultsTypeObject,
+				Value: v1.ParamValue{
+					Type:      v1.ParamTypeObject,
+					ObjectVal: map[string]string{"key1": "value1", "key2": "value2"},
+				},
+			}},
+		},
+	}, {
+		name: "failed child pipeline with results is included",
+		state: PipelineRunState{
+			childPipelineTask("failed-child-pipeline",
+				withPipelineRunResults(makePipelineRunFailed(prs[0]), failedResult)),
+		},
+		expectedResults: map[string][]v1.TaskRunResult{
+			"failed-child-pipeline": {{
+				Name:  "fail-result",
+				Type:  v1.ResultsTypeString,
+				Value: *v1.NewStructuredValues("fail-value"),
+			}},
+		},
+	}, {
+		name: "running child pipeline is excluded",
+		state: PipelineRunState{
+			childPipelineTask("running-child-pipeline", newPipelineRun(prs[0])),
+		},
+		expectedResults: map[string][]v1.TaskRunResult{},
+	}, {
+		name: "child pipeline without child PipelineRuns is excluded",
+		state: PipelineRunState{
+			childPipelineTask("not-started-child-pipeline"),
+		},
+		expectedResults: map[string][]v1.TaskRunResult{},
+	}, {
+		name: "successful child pipeline without results has an empty entry",
+		state: PipelineRunState{
+			childPipelineTask("successful-child-pipeline-without-results", makePipelineRunSucceeded(prs[0])),
+		},
+		expectedResults: map[string][]v1.TaskRunResult{
+			"successful-child-pipeline-without-results": {},
+		},
+	}, {
+		name: "multiple child pipelines",
+		state: PipelineRunState{
+			successfulTask,
+			childPipelineTask("successful-child-pipeline",
+				withPipelineRunResults(makePipelineRunSucceeded(prs[0]), stringResult)),
+			childPipelineTask("failed-child-pipeline",
+				withPipelineRunResults(makePipelineRunFailed(prs[1]), failedResult)),
+		},
+		expectedResults: map[string][]v1.TaskRunResult{
+			"successful-child-pipeline": {{
+				Name:  "string-result",
+				Type:  v1.ResultsTypeString,
+				Value: *v1.NewStructuredValues("string-value"),
+			}},
+			"failed-child-pipeline": {{
+				Name:  "fail-result",
+				Type:  v1.ResultsTypeString,
+				Value: *v1.NewStructuredValues("fail-value"),
+			}},
+		},
+	}}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			actualResults := tc.state.GetChildPipelineRunResults()
+			if d := cmp.Diff(tc.expectedResults, actualResults); d != "" {
+				t.Errorf("Didn't get expected child PipelineRun results map: %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
 func TestPipelineRunState_GetTaskRunsArtifacts(t *testing.T) {
 	testCases := []struct {
 		name              string

@@ -980,3 +980,97 @@ func TestPipelineRun_PinP_PipelineRefInFinally(t *testing.T) {
 	assertPinP(ctx, t, c, expectedChildPR)
 	assertEvents(ctx, t, expectedEventsAmount, expectedKinds, c, namespace)
 }
+
+// @test:execution=parallel
+// TestPipelineRun_PinP_ResultsPropagation verifies that results declared by a child
+// Pipeline propagate to the parent end-to-end: the consumer task receives the child's
+// string, array (whole and indexed) and object results as params and verifies their
+// values in its script; a when expression on the child's string result gates one task
+// and skips another; a finally task consumes the child result; and the parent
+// PipelineRun aggregates the child's results into its own status.results.
+func TestPipelineRun_PinP_ResultsPropagation(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c, namespace := setup(ctx, t, requireAnyGate(map[string]string{
+		"enable-api-fields": "alpha",
+	}))
+	knativetest.CleanupOnInterrupt(func() { tearDown(ctx, t, c, namespace) }, t.Logf)
+	defer tearDown(ctx, t, c, namespace)
+
+	// GIVEN: a child Pipeline declaring string, array and object results and a parent
+	// consuming them in params, when expressions, a finally task and pipeline results.
+	parentPipeline, childPipeline, parentPipelineRun :=
+		th.PipelineRefInPipelineWithManyResults(t, namespace, "pr-pinp-results")
+	childPipelineRunName := parentPipelineRun.Name + "-child"
+
+	// WHEN: the parent only succeeds if the consumer's in-script verification of every
+	// substituted result value passes.
+	createResourcesAndWaitForPipelineRunSuccess(ctx, t, c, namespace, []*v1.Pipeline{parentPipeline, childPipeline}, parentPipelineRun, nil)
+
+	// THEN: the child PipelineRun succeeded.
+	childPr, err := c.V1PipelineRunClient.Get(ctx, childPipelineRunName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Error getting child PipelineRun %s: %s", childPipelineRunName, err)
+	}
+	th.CheckPipelineRunConditionStatusAndReason(t, childPr.Status, corev1.ConditionTrue, v1.PipelineRunReasonSuccessful.String())
+
+	// THEN: the child's results were aggregated into the parent's status.results.
+	parentPr, err := c.V1PipelineRunClient.Get(ctx, parentPipelineRun.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Error getting parent PipelineRun %s: %s", parentPipelineRun.Name, err)
+	}
+	expectedResults := []v1.PipelineRunResult{
+		{Name: "branch", Value: *v1.NewStructuredValues("main")},
+		{Name: "first-platform", Value: *v1.NewStructuredValues("linux/amd64")},
+		{Name: "image-url", Value: *v1.NewStructuredValues("example.com/repo/image")},
+	}
+	sortResults := cmpopts.SortSlices(func(a, b v1.PipelineRunResult) bool { return a.Name < b.Name })
+	if d := cmp.Diff(expectedResults, parentPr.Status.Results, sortResults); d != "" {
+		t.Errorf("Unexpected parent PipelineRun results (-want, +got): %s", d)
+	}
+
+	// THEN: the task gated on the negated when expression was skipped.
+	skipped := false
+	for _, st := range parentPr.Status.SkippedTasks {
+		if st.Name == "skipped-on-branch" && st.Reason == v1.WhenExpressionsSkip {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Errorf("Expected task %q to be skipped due to when expressions; skipped tasks: %+v",
+			"skipped-on-branch", parentPr.Status.SkippedTasks)
+	}
+}
+
+// @test:execution=parallel
+// TestPipelineRun_PinP_ResultsPropagationUndeclaredResult verifies the runtime guard for
+// child-Pipeline result references: a reference to a result the child Pipeline does not
+// declare passes webhook validation (the webhook cannot resolve the child's spec) but
+// fails result validation during reconciliation, failing the parent PipelineRun.
+func TestPipelineRun_PinP_ResultsPropagationUndeclaredResult(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c, namespace := setup(ctx, t, requireAnyGate(map[string]string{
+		"enable-api-fields": "alpha",
+	}))
+	knativetest.CleanupOnInterrupt(func() { tearDown(ctx, t, c, namespace) }, t.Logf)
+	defer tearDown(ctx, t, c, namespace)
+
+	// GIVEN: the parent's consumer references $(tasks.child.results.missing), which the
+	// child Pipeline does not declare.
+	parentPipeline, childPipeline, parentPipelineRun :=
+		th.PipelineRefInPipelineWithUndeclaredResult(t, namespace, "pr-pinp-undeclared-result")
+
+	// WHEN / THEN: the parent fails with InvalidTaskResultReference at runtime.
+	createResourcesAndWaitForPipelineRun(ctx, t, c, namespace,
+		[]*v1.Pipeline{parentPipeline, childPipeline}, parentPipelineRun, nil,
+		Chain(
+			FailedWithReason(v1.PipelineRunReasonInvalidTaskResultReference.String(), parentPipelineRun.Name),
+			FailedWithMessage(`"missing" is not a named result returned by pipeline task "child"`, parentPipelineRun.Name),
+		),
+		"PipelineRunFailed")
+}
