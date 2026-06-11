@@ -42,6 +42,10 @@ type ResolvedResultRef struct {
 	ResultReference v1.ResultRef
 	FromTaskRun     string
 	FromRun         string
+	// FromPipelineRun is the name of the child PipelineRun (Pipelines in Pipelines)
+	// the value was resolved from, when the referenced PipelineTask uses
+	// pipelineRef or pipelineSpec. It is empty for TaskRun and CustomRun results.
+	FromPipelineRun string
 }
 
 // ResolveResultRef resolves any ResultReference that are found in the target ResolvedPipelineTask
@@ -132,6 +136,13 @@ func convertToResultRefs(pipelineRunState PipelineRunState, target *ResolvedPipe
 				return nil, resultRef.PipelineTask, err
 			}
 			resolvedResultRefs = append(resolvedResultRefs, resolved)
+		// Child Pipeline (Pipelines in Pipelines): resolve from the child PipelineRun's results.
+		case referencedPipelineTask.IsChildPipeline():
+			resolved, err := resolveChildPipelineRunResultRef(referencedPipelineTask.ChildPipelineRuns, resultRef)
+			if err != nil {
+				return nil, resultRef.PipelineTask, err
+			}
+			resolvedResultRefs = append(resolvedResultRefs, resolved)
 		default:
 			// Matrixed referenced Pipeline Task
 			if referencedPipelineTask.PipelineTask.IsMatrixed() {
@@ -186,6 +197,24 @@ func paramValueFromCustomRunResult(result string) *v1.ParamValue {
 	return v1.NewStructuredValues(result)
 }
 
+// resolveChildPipelineRunResultRef resolves a result reference whose target PipelineTask
+// runs a child Pipeline (Pipelines in Pipelines). The value is read from the child
+// PipelineRun's status.results. Matrix fan-out of child Pipelines is not supported, so a
+// child-pipeline task has a single child PipelineRun; callers only reach this path once the
+// referenced task isSuccessful()/isFailure(), which guarantees ChildPipelineRuns is non-empty.
+func resolveChildPipelineRunResultRef(childPipelineRuns []*v1.PipelineRun, resultRef *v1.ResultRef) (*ResolvedResultRef, error) {
+	childPipelineRun := childPipelineRuns[0]
+	resultValue, err := findChildPipelineRunResultForParam(childPipelineRun, resultRef)
+	if err != nil {
+		return nil, err
+	}
+	return &ResolvedResultRef{
+		Value:           resultValue,
+		FromPipelineRun: childPipelineRun.Name,
+		ResultReference: *resultRef,
+	}, nil
+}
+
 func resolveResultRef(taskRuns []*v1.TaskRun, resultRef *v1.ResultRef) (*ResolvedResultRef, error) {
 	taskRun := taskRuns[0]
 	taskRunName := taskRun.Name
@@ -209,6 +238,16 @@ func findRunResultForParam(customRun *v1beta1.CustomRun, reference *v1.ResultRef
 	}
 	err := fmt.Errorf("%w: Could not find result with name %s for pipeline task %s", ErrInvalidTaskResultReference, reference.Result, reference.PipelineTask)
 	return "", err
+}
+
+func findChildPipelineRunResultForParam(childPipelineRun *v1.PipelineRun, reference *v1.ResultRef) (v1.ResultValue, error) {
+	for _, result := range childPipelineRun.Status.Results {
+		if result.Name == reference.Result {
+			return result.Value, nil
+		}
+	}
+	err := fmt.Errorf("%w: Could not find result with name %s for pipeline task %s", ErrInvalidTaskResultReference, reference.Result, reference.PipelineTask)
+	return v1.ResultValue{}, err
 }
 
 func findTaskResultForParam(taskRun *v1.TaskRun, reference *v1.ResultRef) (v1.ResultValue, error) {

@@ -1,0 +1,60 @@
+# Pipelines-in-Pipelines example: result propagation from a child Pipeline.
+# A child Pipeline produces an "image-digest" result; the parent consumes it in a
+# downstream task's params and re-exports it as a parent Pipeline result.
+# Requires the alpha feature flag (enable-api-fields: alpha) to be set on the cluster.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-pipeline
+spec:
+  description: Child Pipeline that produces an image-digest result.
+  results:
+    - name: image-digest
+      value: $(tasks.build.results.digest)
+  tasks:
+    - name: build
+      taskSpec:
+        results:
+          - name: digest
+        steps:
+          - name: build
+            image: mirror.gcr.io/busybox
+            script: |
+              printf 'sha256:abc123' | tee "$(results.digest.path)"
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-and-deploy
+spec:
+  description: Parent Pipeline that consumes a child Pipeline result.
+  results:
+    - name: image-digest
+      value: $(tasks.build.results.image-digest)
+  tasks:
+    - name: build
+      pipelineRef:
+        name: build-pipeline
+    - name: deploy
+      runAfter:
+        - build
+      params:
+        - name: digest
+          value: $(tasks.build.results.image-digest)
+      taskSpec:
+        params:
+          - name: digest
+        steps:
+          - name: verify
+            image: mirror.gcr.io/busybox
+            script: |
+              echo "deploying image $(params.digest)"
+              test "$(params.digest)" = "sha256:abc123"
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: pipelines-in-pipelines-results-run-
+spec:
+  pipelineRef:
+    name: build-and-deploy

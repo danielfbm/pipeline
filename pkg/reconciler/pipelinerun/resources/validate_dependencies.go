@@ -72,6 +72,22 @@ func validateResultRef(ref *v1.ResultRef, ptMap map[string]*ResolvedPipelineTask
 		// custom task executes.
 		return nil
 	}
+	if ptMap[ref.PipelineTask].IsChildPipeline() {
+		// Child Pipeline (Pipelines in Pipelines): the result is produced by the
+		// child Pipeline, so validate against the child Pipeline's declared results
+		// rather than a TaskSpec. If the child Pipeline spec has not been resolved
+		// yet, skip validation (mirrors the custom-task behavior above).
+		pipelineSpec := ptMap[ref.PipelineTask].ResolvedPipeline.PipelineSpec
+		if pipelineSpec == nil {
+			return nil
+		}
+		for _, pipelineResult := range pipelineSpec.Results {
+			if pipelineResult.Name == ref.Result {
+				return nil
+			}
+		}
+		return fmt.Errorf("%q is not a named result returned by pipeline task %q", ref.Result, ref.PipelineTask)
+	}
 	if ptMap[ref.PipelineTask].ResolvedTask == nil || ptMap[ref.PipelineTask].ResolvedTask.TaskSpec == nil {
 		return fmt.Errorf("unable to validate result referencing pipeline task %q: task spec not found", ref.PipelineTask)
 	}

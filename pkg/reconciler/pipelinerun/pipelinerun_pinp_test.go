@@ -16,6 +16,7 @@ import (
 	"github.com/tektoncd/pipeline/test"
 	"github.com/tektoncd/pipeline/test/diff"
 	"github.com/tektoncd/pipeline/test/names"
+	"github.com/tektoncd/pipeline/test/parse"
 	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -96,6 +97,337 @@ func TestReconcile_ChildPipelineRunPipelineSpec(t *testing.T) {
 			)
 		})
 	}
+}
+
+// TestReconcile_ChildPipelineResultsAggregatedToStatus verifies that when a child
+// Pipeline (Pipelines in Pipelines) completes with results, those results are
+// aggregated into the parent PipelineRun's status.results via a pipeline-level result
+// that references the child task. The child PipelineRun is seeded already-complete with
+// results and listed in the parent's childReferences, so reconciling the parent observes
+// the child as done, completes the parent, and aggregates the result.
+func TestReconcile_ChildPipelineResultsAggregatedToStatus(t *testing.T) {
+	names.TestingSeed()
+	namespace := "foo"
+
+	parentPipeline := parse.MustParseV1Pipeline(t, `
+metadata:
+  name: test-pipeline
+  namespace: foo
+spec:
+  results:
+  - name: propagated
+    value: $(tasks.child.results.out)
+  tasks:
+  - name: child
+    pipelineSpec:
+      tasks:
+      - name: noop
+        taskSpec:
+          steps:
+          - name: s
+            image: mirror.gcr.io/busybox
+`)
+	parentPipelineRun := parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: parent-pipeline-run
+  namespace: foo
+spec:
+  pipelineRef:
+    name: test-pipeline
+  timeouts:
+    pipeline: "0"
+status:
+  conditions:
+  - reason: Running
+    status: "Unknown"
+    type: Succeeded
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: PipelineRun
+    name: parent-pipeline-run-child
+    pipelineTaskName: child
+  startTime: "2021-12-31T00:00:00Z"
+`)
+	childPipelineRun := parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: parent-pipeline-run-child
+  namespace: foo
+spec:
+  pipelineSpec:
+    tasks:
+    - name: noop
+      taskSpec:
+        steps:
+        - name: s
+          image: mirror.gcr.io/busybox
+status:
+  conditions:
+  - reason: Succeeded
+    status: "True"
+    type: Succeeded
+  results:
+  - name: out
+    value: child-value
+`)
+
+	testData := test.Data{
+		PipelineRuns: []*v1.PipelineRun{parentPipelineRun, childPipelineRun},
+		Pipelines:    []*v1.Pipeline{parentPipeline},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	}
+
+	prt := newPipelineRunTest(t, testData)
+	defer prt.Cancel()
+
+	reconciledRun, _ := prt.reconcileRun(namespace, parentPipelineRun.Name, []string{}, false)
+
+	th.CheckPipelineRunConditionStatusAndReason(
+		t,
+		reconciledRun.Status,
+		corev1.ConditionTrue,
+		v1.PipelineRunReasonSuccessful.String(),
+	)
+
+	wantResults := []v1.PipelineRunResult{{
+		Name:  "propagated",
+		Value: *v1.NewStructuredValues("child-value"),
+	}}
+	if d := cmp.Diff(wantResults, reconciledRun.Status.Results); d != "" {
+		t.Errorf("child Pipeline result not aggregated into parent status.results. Diff %s", diff.PrintWantGot(d))
+	}
+}
+
+// TestReconcile_ChildPipelineResultPropagatedToConsumerParam verifies the param path:
+// a downstream task consuming $(tasks.child.results.out) gets the resolved child Pipeline
+// result substituted into the TaskRun it creates. The child Pipeline is seeded complete
+// with results; the consumer task is not yet scheduled, so reconciling the parent schedules
+// it and creates its TaskRun with the resolved param value.
+func TestReconcile_ChildPipelineResultPropagatedToConsumerParam(t *testing.T) {
+	names.TestingSeed()
+	namespace := "foo"
+
+	parentPipeline := parse.MustParseV1Pipeline(t, `
+metadata:
+  name: test-pipeline
+  namespace: foo
+spec:
+  tasks:
+  - name: child
+    pipelineSpec:
+      tasks:
+      - name: noop
+        taskSpec:
+          steps:
+          - name: s
+            image: mirror.gcr.io/busybox
+  - name: consumer
+    runAfter: [child]
+    taskRef:
+      name: consumer-task
+    params:
+    - name: msg
+      value: $(tasks.child.results.out)
+`)
+	consumerTask := parse.MustParseV1Task(t, `
+metadata:
+  name: consumer-task
+  namespace: foo
+spec:
+  params:
+  - name: msg
+    type: string
+  steps:
+  - name: echo
+    image: mirror.gcr.io/busybox
+    script: 'echo $(params.msg)'
+`)
+	parentPipelineRun := parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: parent-pipeline-run
+  namespace: foo
+spec:
+  pipelineRef:
+    name: test-pipeline
+  timeouts:
+    pipeline: "0"
+status:
+  conditions:
+  - reason: Running
+    status: "Unknown"
+    type: Succeeded
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: PipelineRun
+    name: parent-pipeline-run-child
+    pipelineTaskName: child
+  startTime: "2021-12-31T00:00:00Z"
+`)
+	childPipelineRun := parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: parent-pipeline-run-child
+  namespace: foo
+spec:
+  pipelineSpec:
+    tasks:
+    - name: noop
+      taskSpec:
+        steps:
+        - name: s
+          image: mirror.gcr.io/busybox
+status:
+  conditions:
+  - reason: Succeeded
+    status: "True"
+    type: Succeeded
+  results:
+  - name: out
+    value: child-value
+`)
+
+	testData := test.Data{
+		PipelineRuns: []*v1.PipelineRun{parentPipelineRun, childPipelineRun},
+		Pipelines:    []*v1.Pipeline{parentPipeline},
+		Tasks:        []*v1.Task{consumerTask},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	}
+
+	prt := newPipelineRunTest(t, testData)
+	defer prt.Cancel()
+
+	reconciledRun, clients := prt.reconcileRun(namespace, parentPipelineRun.Name, []string{}, false)
+
+	// Parent is still running: the consumer TaskRun has just been created.
+	th.CheckPipelineRunConditionStatusAndReason(
+		t,
+		reconciledRun.Status,
+		corev1.ConditionUnknown,
+		v1.PipelineRunReasonRunning.String(),
+	)
+
+	taskRuns := getTaskRunsForPipelineRun(prt.TestAssets.Ctx, t, clients, namespace, parentPipelineRun.Name)
+	consumerTR := taskRunByPipelineTask(t, taskRuns, "consumer")
+	gotMsg := paramValue(t, consumerTR, "msg")
+	if gotMsg != "child-value" {
+		t.Errorf("consumer TaskRun param %q = %q, want %q", "msg", gotMsg, "child-value")
+	}
+}
+
+// TestReconcile_ChildPipelineResultReferencePassesValidation verifies the fresh-start
+// reconcile path: ValidatePipelineTaskResults / ValidatePipelineResults run only before the
+// first task run, and must accept a result reference whose producing PipelineTask is a child
+// Pipeline (validating against the child Pipeline's declared results, not a TaskSpec). This is
+// the path the seeded-child tests skip; a regression here fails the PipelineRun with
+// InvalidTaskResultReference instead of creating the child PipelineRun.
+func TestReconcile_ChildPipelineResultReferencePassesValidation(t *testing.T) {
+	names.TestingSeed()
+	namespace := "foo"
+
+	parentPipeline := parse.MustParseV1Pipeline(t, `
+metadata:
+  name: test-pipeline
+  namespace: foo
+spec:
+  results:
+  - name: propagated
+    value: $(tasks.child.results.out)
+  tasks:
+  - name: child
+    pipelineSpec:
+      results:
+      - name: out
+        value: $(tasks.noop.results.r)
+      tasks:
+      - name: noop
+        taskSpec:
+          results:
+          - name: r
+          steps:
+          - name: s
+            image: mirror.gcr.io/busybox
+            script: 'printf v | tee "$(results.r.path)"'
+  - name: consumer
+    runAfter: [child]
+    params:
+    - name: msg
+      value: $(tasks.child.results.out)
+    taskRef:
+      name: consumer-task
+`)
+	consumerTask := parse.MustParseV1Task(t, `
+metadata:
+  name: consumer-task
+  namespace: foo
+spec:
+  params:
+  - name: msg
+    type: string
+  steps:
+  - name: echo
+    image: mirror.gcr.io/busybox
+    script: 'echo $(params.msg)'
+`)
+	parentPipelineRun := parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: parent-pipeline-run
+  namespace: foo
+spec:
+  pipelineRef:
+    name: test-pipeline
+`)
+
+	testData := test.Data{
+		PipelineRuns: []*v1.PipelineRun{parentPipelineRun},
+		Pipelines:    []*v1.Pipeline{parentPipeline},
+		Tasks:        []*v1.Task{consumerTask},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	}
+
+	prt := newPipelineRunTest(t, testData)
+	defer prt.Cancel()
+
+	// A fresh PipelineRun: this reconcile runs result-reference validation. It must
+	// not fail with InvalidTaskResultReference; the child PipelineRun is created and
+	// the parent goes Running.
+	reconciledRun, clients := prt.reconcileRun(namespace, parentPipelineRun.Name, []string{}, false)
+
+	th.CheckPipelineRunConditionStatusAndReason(
+		t,
+		reconciledRun.Status,
+		corev1.ConditionUnknown,
+		v1.PipelineRunReasonRunning.String(),
+	)
+	childPipelineRuns := getChildPipelineRunsForPipelineRun(prt.TestAssets.Ctx, t, clients, namespace, parentPipelineRun.Name)
+	validateChildPipelineRunCount(t, childPipelineRuns, 1)
+}
+
+// taskRunByPipelineTask returns the single TaskRun created for the given pipeline task name.
+func taskRunByPipelineTask(t *testing.T, taskRuns map[string]*v1.TaskRun, pipelineTaskName string) *v1.TaskRun {
+	t.Helper()
+	var found *v1.TaskRun
+	for _, tr := range taskRuns {
+		if tr.Labels[pipeline.PipelineTaskLabelKey] == pipelineTaskName {
+			if found != nil {
+				t.Fatalf("expected exactly one TaskRun for pipeline task %q, found more than one", pipelineTaskName)
+			}
+			found = tr
+		}
+	}
+	if found == nil {
+		t.Fatalf("no TaskRun created for pipeline task %q", pipelineTaskName)
+	}
+	return found
+}
+
+// paramValue returns the string value of the named param on a TaskRun.
+func paramValue(t *testing.T, tr *v1.TaskRun, name string) string {
+	t.Helper()
+	for _, p := range tr.Spec.Params {
+		if p.Name == name {
+			return p.Value.StringVal
+		}
+	}
+	t.Fatalf("TaskRun %q has no param %q", tr.Name, name)
+	return ""
 }
 
 func reconcileOncePinP(

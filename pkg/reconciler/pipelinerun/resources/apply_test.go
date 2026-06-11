@@ -5143,6 +5143,62 @@ func TestPropagateResults(t *testing.T) {
 				},
 			},
 		}, {
+			// Child Pipeline (Pipelines in Pipelines) results are propagated into a
+			// downstream task's spec just like TaskRun results.
+			name: "propagate child Pipeline result",
+			resolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: &v1.TaskSpec{
+						Steps: []v1.Step{
+							{
+								Name: "$(tasks.child.results.out)",
+							},
+						},
+					},
+				},
+			},
+			runStates: resources.PipelineRunState{
+				{
+					PipelineTask: &v1.PipelineTask{
+						Name:        "child",
+						PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+					},
+					ChildPipelineRuns: []*v1.PipelineRun{
+						{
+							Status: v1.PipelineRunStatus{
+								Status: duckv1.Status{
+									Conditions: duckv1.Conditions{
+										{
+											Type:   apis.ConditionSucceeded,
+											Status: corev1.ConditionTrue,
+										},
+									},
+								},
+								PipelineRunStatusFields: v1.PipelineRunStatusFields{
+									Results: []v1.PipelineRunResult{
+										{
+											Name:  "out",
+											Value: *v1.NewStructuredValues("child-step"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedResolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: &v1.TaskSpec{
+						Steps: []v1.Step{
+							{
+								Name: "child-step",
+							},
+						},
+					},
+				},
+			},
+		}, {
 			name: "not propagate result when resolved task is nil",
 			resolvedTask: &resources.ResolvedPipelineTask{
 				ResolvedTask: nil,

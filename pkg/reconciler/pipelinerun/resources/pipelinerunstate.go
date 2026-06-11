@@ -271,6 +271,53 @@ func (state PipelineRunState) GetRunsResults() map[string][]v1beta1.CustomRunRes
 	return results
 }
 
+// GetChildPipelineRunsResults returns a map of all completed child PipelineRuns (Pipelines in
+// Pipelines) in the state, keyed by the parent pipeline task name, with the child PipelineRun's
+// status.results converted to TaskRunResults so they can be consumed by the same result
+// propagation machinery as TaskRun results (status.results aggregation, when-expression and
+// param substitution, workspace bindings). It includes child pipelines which have completed
+// successfully or with failure (consistent with GetTaskRunsResults). Matrix fan-out of child
+// Pipelines is not supported, so each child-pipeline task contributes a single child PipelineRun.
+func (state PipelineRunState) GetChildPipelineRunsResults() map[string][]v1.TaskRunResult {
+	results := make(map[string][]v1.TaskRunResult)
+	for _, rpt := range state {
+		if !rpt.IsChildPipeline() {
+			continue
+		}
+		if !rpt.isSuccessful() && !rpt.isFailure() {
+			continue
+		}
+		if len(rpt.ChildPipelineRuns) == 0 {
+			continue
+		}
+		childResults := rpt.ChildPipelineRuns[0].Status.Results
+		if len(childResults) == 0 {
+			continue
+		}
+		trResults := make([]v1.TaskRunResult, 0, len(childResults))
+		for _, r := range childResults {
+			trResults = append(trResults, v1.TaskRunResult{
+				Name:  r.Name,
+				Type:  v1.ResultsType(r.Value.Type),
+				Value: r.Value,
+			})
+		}
+		results[rpt.PipelineTask.Name] = trResults
+	}
+	return results
+}
+
+// GetTaskRunsAndChildPipelineRunsResults returns the union of GetTaskRunsResults and
+// GetChildPipelineRunsResults, keyed by pipeline task name. A pipeline task name is either a
+// regular Task or a child Pipeline (never both), so the two maps never collide.
+func (state PipelineRunState) GetTaskRunsAndChildPipelineRunsResults() map[string][]v1.TaskRunResult {
+	results := state.GetTaskRunsResults()
+	for ptName, childResults := range state.GetChildPipelineRunsResults() {
+		results[ptName] = childResults
+	}
+	return results
+}
+
 // GetChildReferences returns a slice of references, including version, kind, name, and pipeline task name, for all
 // child PipelineRuns, TaskRuns and Runs in the state.
 func (facts *PipelineRunFacts) GetChildReferences() []v1.ChildStatusReference {
