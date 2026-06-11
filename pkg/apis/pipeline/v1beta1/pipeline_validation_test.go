@@ -18,6 +18,7 @@ package v1beta1
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -4932,33 +4933,11 @@ func TestGetIndexingReferencesToArrayParams(t *testing.T) {
 	}
 }
 
-func TestValidatePipelineRefResultReferencesDisallowed(t *testing.T) {
-	// happy path: a PinP task that is not consumed by any result reference is allowed.
-	t.Run("pipelineRef task not referenced", func(t *testing.T) {
-		tasks := []PipelineTask{
-			{
-				Name:        "child",
-				PipelineRef: &PipelineRef{Name: "child-pipeline"},
-			},
-			{
-				Name:    "consumer",
-				TaskRef: &TaskRef{Name: "echo"},
-				Params: Params{{
-					Name:  "msg",
-					Value: *NewStructuredValues("hello"),
-				}},
-			},
-		}
-		if err := validatePipelineRefResultReferencesDisallowed(tasks, nil); err != nil {
-			t.Errorf("unexpected error for non-referencing pipeline: %v", err)
-		}
-	})
-
+func TestValidateChildPipelineResultReferencesAllowed(t *testing.T) {
 	tests := []struct {
 		desc    string
 		tasks   []PipelineTask
 		finally []PipelineTask
-		wantMsg string
 	}{{
 		desc: "task params reference a pipelineRef task result",
 		tasks: []PipelineTask{
@@ -4975,13 +4954,17 @@ func TestValidatePipelineRefResultReferencesDisallowed(t *testing.T) {
 				}},
 			},
 		},
-		wantMsg: `invalid value: result reference to pipelineTask "child" is not supported: referenced task uses pipelineRef or pipelineSpec and result propagation from child Pipelines is not yet implemented: tasks[1]`,
 	}, {
 		desc: "task when expression references a pipelineSpec task result",
 		tasks: []PipelineTask{
 			{
-				Name:         "child",
-				PipelineSpec: &PipelineSpec{},
+				Name: "child",
+				PipelineSpec: &PipelineSpec{
+					Tasks: []PipelineTask{{
+						Name:    "child-task",
+						TaskRef: &TaskRef{Name: "echo"},
+					}},
+				},
 			},
 			{
 				Name:    "consumer",
@@ -4993,7 +4976,6 @@ func TestValidatePipelineRefResultReferencesDisallowed(t *testing.T) {
 				}},
 			},
 		},
-		wantMsg: `invalid value: result reference to pipelineTask "child" is not supported: referenced task uses pipelineRef or pipelineSpec and result propagation from child Pipelines is not yet implemented: tasks[1]`,
 	}, {
 		desc: "finally task references a pipelineRef task result",
 		tasks: []PipelineTask{
@@ -5012,16 +4994,61 @@ func TestValidatePipelineRefResultReferencesDisallowed(t *testing.T) {
 				}},
 			},
 		},
-		wantMsg: `invalid value: result reference to pipelineTask "child" is not supported: referenced task uses pipelineRef or pipelineSpec and result propagation from child Pipelines is not yet implemented: finally[0]`,
 	}}
 	for _, tc := range tests {
 		t.Run(tc.desc, func(t *testing.T) {
-			err := validatePipelineRefResultReferencesDisallowed(tc.tasks, tc.finally)
-			if err == nil {
-				t.Fatalf("expected error, got nil")
+			ps := &PipelineSpec{Tasks: tc.tasks, Finally: tc.finally}
+			ctx := cfgtesting.EnableAlphaAPIFields(context.Background())
+			if err := ps.Validate(ctx); err != nil {
+				t.Errorf("unexpected error validating result reference to a child Pipeline: %v", err)
 			}
-			if d := cmp.Diff(tc.wantMsg, err.Error(), cmpopts.IgnoreUnexported(apis.FieldError{})); d != "" {
-				t.Errorf("unexpected error diff %s", diff.PrintWantGot(d))
+		})
+	}
+}
+
+func TestValidateMatrixDisallowedWithChildPipeline(t *testing.T) {
+	tests := []struct {
+		desc string
+		pt   PipelineTask
+	}{{
+		desc: "matrix with pipelineRef",
+		pt: PipelineTask{
+			Name:        "child",
+			PipelineRef: &PipelineRef{Name: "child-pipeline"},
+			Matrix: &Matrix{
+				Params: Params{{
+					Name:  "platform",
+					Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"linux", "mac"}},
+				}},
+			},
+		},
+	}, {
+		desc: "matrix with pipelineSpec",
+		pt: PipelineTask{
+			Name: "child",
+			PipelineSpec: &PipelineSpec{
+				Tasks: []PipelineTask{{
+					Name:    "child-task",
+					TaskRef: &TaskRef{Name: "echo"},
+				}},
+			},
+			Matrix: &Matrix{
+				Params: Params{{
+					Name:  "platform",
+					Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"linux", "mac"}},
+				}},
+			},
+		},
+	}}
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctx := cfgtesting.EnableAlphaAPIFields(context.Background())
+			err := tc.pt.validateMatrix(ctx)
+			if err == nil {
+				t.Fatalf("expected matrix with pipelineRef/pipelineSpec to be rejected, got nil")
+			}
+			if !strings.Contains(err.Error(), "matrix is not supported for a PipelineTask that uses pipelineRef or pipelineSpec") {
+				t.Errorf("unexpected error: %v", err)
 			}
 		})
 	}

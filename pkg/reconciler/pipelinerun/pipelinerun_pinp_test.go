@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/tektoncd/pipeline/pkg/apis/config"
@@ -23,8 +24,10 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ktesting "k8s.io/client-go/testing"
+	"knative.dev/pkg/apis"
 )
 
 // TestReconcile_ChildPipelineRunPipelineSpec verifies the reconciliation logic for PipelineRuns that create child
@@ -1204,5 +1207,364 @@ func TestDetectPipelineRefCycle_ParentLookupError(t *testing.T) {
 	if !strings.Contains(err.Error(), "cycle detection in pipeline-in-pipeline") ||
 		!strings.Contains(err.Error(), "parent-pr") {
 		t.Fatalf("error message missing expected context: %v", err)
+	}
+}
+
+// markChildPipelineRunSucceeded simulates the completion of a child PipelineRun: it
+// returns a deep copy of the given PipelineRun with the Succeeded condition set to
+// True and the given pipeline results reported in its status.
+func markChildPipelineRunSucceeded(childPipelineRun *v1.PipelineRun, results ...v1.PipelineRunResult) *v1.PipelineRun {
+	completed := childPipelineRun.DeepCopy()
+	completed.Status.SetCondition(&apis.Condition{
+		Type:    apis.ConditionSucceeded,
+		Status:  corev1.ConditionTrue,
+		Reason:  v1.PipelineRunReasonSuccessful.String(),
+		Message: "All Tasks have completed executing",
+	})
+	completed.Status.StartTime = &metav1.Time{Time: time.Now().Add(-time.Minute)}
+	completed.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+	completed.Status.Results = results
+	return completed
+}
+
+// markTaskRunSucceeded simulates the completion of a TaskRun: it returns a deep copy
+// of the given TaskRun with the Succeeded condition set to True.
+func markTaskRunSucceeded(tr *v1.TaskRun) *v1.TaskRun {
+	completed := tr.DeepCopy()
+	completed.Status.SetCondition(&apis.Condition{
+		Type:    apis.ConditionSucceeded,
+		Status:  corev1.ConditionTrue,
+		Reason:  v1.TaskRunReasonSuccessful.String(),
+		Message: "All Steps have completed executing",
+	})
+	completed.Status.StartTime = &metav1.Time{Time: time.Now().Add(-time.Minute)}
+	completed.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+	return completed
+}
+
+// getConsumerTaskRun fetches the "consumer" pipeline task's TaskRun created for the
+// parent PipelineRun and fails the test if it does not exist or is not the only TaskRun.
+func getConsumerTaskRun(ctx context.Context, t *testing.T, clients test.Clients, namespace, parentPipelineRunName string) *v1.TaskRun {
+	t.Helper()
+
+	taskRuns := getTaskRunsForPipelineRun(ctx, t, clients, namespace, parentPipelineRunName)
+	validateTaskRunsCount(t, taskRuns, 1)
+	consumerTaskRunName := parentPipelineRunName + "-consumer"
+	consumerTaskRun, exists := taskRuns[consumerTaskRunName]
+	if !exists {
+		t.Fatalf("Expected consumer TaskRun %q to be created, got %v", consumerTaskRunName, taskRuns)
+	}
+	return consumerTaskRun
+}
+
+// TestReconcile_ChildPipelineRunResultsPropagation verifies the full results-propagation
+// flow for Pipelines-in-Pipelines (TEP-0056) through the real Reconcile loop:
+//  1. Reconcile 1 creates the child PipelineRun for the pipelineRef task "child".
+//  2. After the child PipelineRun completes successfully reporting the pipeline result
+//     "out", the next reconcile creates the TaskRun for the downstream task "consumer"
+//     with $(tasks.child.results.out) substituted into its "msg" param.
+//  3. After the consumer TaskRun completes, the final reconcile marks the parent
+//     PipelineRun Succeeded and aggregates the child's result into the parent's
+//     pipeline result "parent-out".
+func TestReconcile_ChildPipelineRunResultsPropagation(t *testing.T) {
+	names.TestingSeed()
+	namespace := "foo"
+	parentPipelineRunName := "parent-pipeline-run"
+	parentPipeline, childPipeline, parentPipelineRun :=
+		th.OnePipelineRefInPipelineWithResults(t, namespace, parentPipelineRunName)
+
+	// Reconcile 1: the child PipelineRun is created; the consumer must wait for its result.
+	testData := test.Data{
+		PipelineRuns: []*v1.PipelineRun{parentPipelineRun},
+		Pipelines:    []*v1.Pipeline{parentPipeline, childPipeline},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	}
+	reconciledParent, childPipelineRuns := reconcileOncePinP(
+		t,
+		testData,
+		namespace,
+		parentPipelineRunName,
+		[]string{"Normal Started", "Normal Running Tasks Completed: 0"},
+	)
+	validateChildPipelineRunCount(t, childPipelineRuns, 1)
+	childPipelineRun := getChildPipelineRunByName(t, childPipelineRuns, parentPipelineRunName+"-child")
+
+	// Simulate the child PipelineRun finishing successfully and reporting its result.
+	completedChild := markChildPipelineRunSucceeded(
+		childPipelineRun,
+		v1.PipelineRunResult{Name: "out", Value: *v1.NewStructuredValues("hello-from-child")},
+	)
+
+	// Reconcile 2: the consumer TaskRun is created with the child's result substituted.
+	prt := newPipelineRunTest(t, test.Data{
+		PipelineRuns: []*v1.PipelineRun{reconciledParent, completedChild},
+		Pipelines:    []*v1.Pipeline{parentPipeline, childPipeline},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	})
+	defer prt.Cancel()
+	reconciledParent, clients := prt.reconcileRun(namespace, parentPipelineRunName, []string{}, false)
+
+	consumerTaskRun := getConsumerTaskRun(prt.TestAssets.Ctx, t, clients, namespace, parentPipelineRunName)
+	var msgValue *v1.ParamValue
+	for _, p := range consumerTaskRun.Spec.Params {
+		if p.Name == "msg" {
+			msgValue = &p.Value
+		}
+	}
+	if msgValue == nil {
+		t.Fatalf("Expected consumer TaskRun to have a param %q, got params %v", "msg", consumerTaskRun.Spec.Params)
+	}
+	if msgValue.StringVal != "hello-from-child" {
+		t.Errorf("Expected consumer TaskRun param msg to be %q, got %q", "hello-from-child", msgValue.StringVal)
+	}
+
+	// Simulate the consumer TaskRun finishing successfully.
+	completedConsumer := markTaskRunSucceeded(consumerTaskRun)
+
+	// Reconcile 3: all pipeline tasks are done; the parent PipelineRun succeeds and
+	// aggregates the child PipelineRun's result into its own pipeline results.
+	prtFinal := newPipelineRunTest(t, test.Data{
+		PipelineRuns: []*v1.PipelineRun{reconciledParent, completedChild},
+		TaskRuns:     []*v1.TaskRun{completedConsumer},
+		Pipelines:    []*v1.Pipeline{parentPipeline, childPipeline},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	})
+	defer prtFinal.Cancel()
+	finalRun, _ := prtFinal.reconcileRun(namespace, parentPipelineRunName, []string{}, false)
+
+	th.CheckPipelineRunConditionStatusAndReason(
+		t,
+		finalRun.Status,
+		corev1.ConditionTrue,
+		v1.PipelineRunReasonSuccessful.String(),
+	)
+	expectedResults := []v1.PipelineRunResult{{Name: "parent-out", Value: *v1.NewStructuredValues("hello-from-child")}}
+	if d := cmp.Diff(expectedResults, finalRun.Status.Results); d != "" {
+		t.Errorf("Expected parent PipelineRun results to aggregate the child PipelineRun result. Diff %s", diff.PrintWantGot(d))
+	}
+}
+
+// TestReconcile_ChildPipelineRunResultsChainedToChildPipeline verifies that a child
+// PipelineRun's result can be consumed as a param by a SECOND child-pipeline task
+// (TEP-0056) through the real Reconcile loop:
+//  1. Reconcile 1 creates the child PipelineRun for the pipelineRef task "child-a" only;
+//     "child-b" must wait for child-a's result.
+//  2. After child-a's PipelineRun completes successfully reporting the pipeline result
+//     "out", the next reconcile creates the child PipelineRun for "child-b" with
+//     $(tasks.child-a.results.out) substituted into its "msg" spec param.
+func TestReconcile_ChildPipelineRunResultsChainedToChildPipeline(t *testing.T) {
+	names.TestingSeed()
+	namespace := "foo"
+	parentPipelineRunName := "parent-pipeline-run"
+	parentPipeline, childPipelineA, childPipelineB, parentPipelineRun :=
+		th.TwoChainedPipelineRefsInPipeline(t, namespace, parentPipelineRunName)
+
+	// Reconcile 1: only child-a's PipelineRun is created; child-b must wait for its result.
+	testData := test.Data{
+		PipelineRuns: []*v1.PipelineRun{parentPipelineRun},
+		Pipelines:    []*v1.Pipeline{parentPipeline, childPipelineA, childPipelineB},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	}
+	reconciledParent, childPipelineRuns := reconcileOncePinP(
+		t,
+		testData,
+		namespace,
+		parentPipelineRunName,
+		[]string{"Normal Started", "Normal Running Tasks Completed: 0"},
+	)
+	validateChildPipelineRunCount(t, childPipelineRuns, 1)
+	childAPipelineRun := getChildPipelineRunByName(t, childPipelineRuns, parentPipelineRunName+"-child-a")
+
+	// Simulate child-a's PipelineRun finishing successfully and reporting its result.
+	completedChildA := markChildPipelineRunSucceeded(
+		childAPipelineRun,
+		v1.PipelineRunResult{Name: "out", Value: *v1.NewStructuredValues("hello-from-child-a")},
+	)
+
+	// Reconcile 2: child-b's PipelineRun is created with child-a's result substituted
+	// into its "msg" spec param.
+	prt := newPipelineRunTest(t, test.Data{
+		PipelineRuns: []*v1.PipelineRun{reconciledParent, completedChildA},
+		Pipelines:    []*v1.Pipeline{parentPipeline, childPipelineA, childPipelineB},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	})
+	defer prt.Cancel()
+	_, clients := prt.reconcileRun(namespace, parentPipelineRunName, []string{}, false)
+
+	childPipelineRuns = getChildPipelineRunsForPipelineRun(
+		prt.TestAssets.Ctx,
+		t,
+		clients,
+		namespace,
+		parentPipelineRunName,
+	)
+	validateChildPipelineRunCount(t, childPipelineRuns, 2)
+	childBPipelineRun := getChildPipelineRunByName(t, childPipelineRuns, parentPipelineRunName+"-child-b")
+
+	var msgValue *v1.ParamValue
+	for _, p := range childBPipelineRun.Spec.Params {
+		if p.Name == "msg" {
+			msgValue = &p.Value
+		}
+	}
+	if msgValue == nil {
+		t.Fatalf("Expected child-b PipelineRun to have a param %q, got params %v", "msg", childBPipelineRun.Spec.Params)
+	}
+	if msgValue.StringVal != "hello-from-child-a" {
+		t.Errorf("Expected child-b PipelineRun param msg to be %q, got %q", "hello-from-child-a", msgValue.StringVal)
+	}
+}
+
+// TestReconcile_ChildPipelineRunResultsPropagation_MissingResult verifies that when a
+// child PipelineRun completes successfully but does NOT report the result referenced
+// by a downstream task, the consumer TaskRun is never created and the parent
+// PipelineRun fails result validation (reason PipelineValidationFailed, with a
+// ResultValidationFailed event), mirroring the behavior for regular pipeline tasks
+// that complete without emitting a referenced result.
+func TestReconcile_ChildPipelineRunResultsPropagation_MissingResult(t *testing.T) {
+	names.TestingSeed()
+	namespace := "foo"
+	parentPipelineRunName := "parent-pipeline-run"
+	parentPipeline, childPipeline, parentPipelineRun :=
+		th.OnePipelineRefInPipelineWithResults(t, namespace, parentPipelineRunName)
+	// Drop the parent's own pipeline result. It references the same missing child
+	// result, and its (separate) failure to resolve would otherwise return a
+	// non-permanent error from the reconciler; this test isolates the
+	// CheckMissingResultReferences behavior for the consumer task.
+	parentPipeline.Spec.Results = nil
+
+	// Reconcile 1: the child PipelineRun is created.
+	testData := test.Data{
+		PipelineRuns: []*v1.PipelineRun{parentPipelineRun},
+		Pipelines:    []*v1.Pipeline{parentPipeline, childPipeline},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	}
+	reconciledParent, childPipelineRuns := reconcileOncePinP(
+		t,
+		testData,
+		namespace,
+		parentPipelineRunName,
+		[]string{"Normal Started", "Normal Running Tasks Completed: 0"},
+	)
+	validateChildPipelineRunCount(t, childPipelineRuns, 1)
+	childPipelineRun := getChildPipelineRunByName(t, childPipelineRuns, parentPipelineRunName+"-child")
+
+	// Simulate the child PipelineRun finishing successfully WITHOUT reporting the
+	// result "out" that the consumer task references.
+	completedChild := markChildPipelineRunSucceeded(childPipelineRun)
+
+	// Reconcile 2: the consumer's result reference cannot be resolved from a
+	// successfully-completed child pipeline, so the run fails validation.
+	prt := newPipelineRunTest(t, test.Data{
+		PipelineRuns: []*v1.PipelineRun{reconciledParent, completedChild},
+		Pipelines:    []*v1.Pipeline{parentPipeline, childPipeline},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	})
+	defer prt.Cancel()
+	reconciledRun, clients := prt.reconcileRun(
+		namespace,
+		parentPipelineRunName,
+		[]string{"Normal Started", "Warning ResultValidationFailed", "Warning Failed"},
+		false,
+	)
+
+	th.CheckPipelineRunConditionStatusAndReason(
+		t,
+		reconciledRun.Status,
+		corev1.ConditionFalse,
+		v1.PipelineRunReasonFailedValidation.String(),
+	)
+	cond := reconciledRun.Status.GetCondition(apis.ConditionSucceeded)
+	if !strings.Contains(cond.Message, `did not emit the result "out"`) {
+		t.Errorf("Expected failure message to mention the missing result %q, got %q", "out", cond.Message)
+	}
+	if reconciledRun.Status.CompletionTime == nil {
+		t.Errorf("Expected a CompletionTime on the failed PipelineRun but was nil")
+	}
+
+	// The consumer TaskRun must NOT have been created.
+	taskRuns := getTaskRunsForPipelineRun(prt.TestAssets.Ctx, t, clients, namespace, parentPipelineRunName)
+	validateTaskRunsCount(t, taskRuns, 0)
+}
+
+// TestReconcile_ChildPipelineRunResultsPropagation_WhenSkipped verifies that a child
+// PipelineRun's result can guard a downstream task via a when expression: the consumer
+// is guarded by `$(tasks.child.results.out) in [skip-me]` while the child reports
+// "hello-from-child", so the consumer is skipped (no TaskRun created), the parent
+// PipelineRun completes successfully with reason Completed, lists the consumer in
+// skippedTasks, and still aggregates the child's result into its pipeline results.
+func TestReconcile_ChildPipelineRunResultsPropagation_WhenSkipped(t *testing.T) {
+	names.TestingSeed()
+	namespace := "foo"
+	parentPipelineRunName := "parent-pipeline-run"
+	parentPipeline, childPipeline, parentPipelineRun :=
+		th.OnePipelineRefInPipelineWithResults(t, namespace, parentPipelineRunName)
+	// Guard the consumer task with a when expression on the child pipeline's result.
+	parentPipeline.Spec.Tasks[1].When = v1.WhenExpressions{{
+		Input:    "$(tasks.child.results.out)",
+		Operator: selection.In,
+		Values:   []string{"skip-me"},
+	}}
+
+	// Reconcile 1: the child PipelineRun is created.
+	testData := test.Data{
+		PipelineRuns: []*v1.PipelineRun{parentPipelineRun},
+		Pipelines:    []*v1.Pipeline{parentPipeline, childPipeline},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	}
+	reconciledParent, childPipelineRuns := reconcileOncePinP(
+		t,
+		testData,
+		namespace,
+		parentPipelineRunName,
+		[]string{"Normal Started", "Normal Running Tasks Completed: 0"},
+	)
+	validateChildPipelineRunCount(t, childPipelineRuns, 1)
+	childPipelineRun := getChildPipelineRunByName(t, childPipelineRuns, parentPipelineRunName+"-child")
+
+	// Simulate the child PipelineRun finishing successfully with a result that does
+	// NOT satisfy the consumer's when expression.
+	completedChild := markChildPipelineRunSucceeded(
+		childPipelineRun,
+		v1.PipelineRunResult{Name: "out", Value: *v1.NewStructuredValues("hello-from-child")},
+	)
+
+	// Reconcile 2: the consumer is skipped and the parent completes successfully.
+	prt := newPipelineRunTest(t, test.Data{
+		PipelineRuns: []*v1.PipelineRun{reconciledParent, completedChild},
+		Pipelines:    []*v1.Pipeline{parentPipeline, childPipeline},
+		ConfigMaps:   th.NewAlphaFeatureFlagsConfigMapInSlice(),
+	})
+	defer prt.Cancel()
+	reconciledRun, clients := prt.reconcileRun(namespace, parentPipelineRunName, []string{}, false)
+
+	th.CheckPipelineRunConditionStatusAndReason(
+		t,
+		reconciledRun.Status,
+		corev1.ConditionTrue,
+		v1.PipelineRunReasonCompleted.String(),
+	)
+
+	// No TaskRun is created for the skipped consumer task.
+	taskRuns := getTaskRunsForPipelineRun(prt.TestAssets.Ctx, t, clients, namespace, parentPipelineRunName)
+	validateTaskRunsCount(t, taskRuns, 0)
+
+	expectedSkipped := []v1.SkippedTask{{
+		Name:   "consumer",
+		Reason: v1.WhenExpressionsSkip,
+		WhenExpressions: v1.WhenExpressions{{
+			Input:    "hello-from-child",
+			Operator: selection.In,
+			Values:   []string{"skip-me"},
+		}},
+	}}
+	if d := cmp.Diff(expectedSkipped, reconciledRun.Status.SkippedTasks); d != "" {
+		t.Errorf("Expected the consumer task to be skipped due to its when expression. Diff %s", diff.PrintWantGot(d))
+	}
+
+	// The child's result is still aggregated into the parent's pipeline results.
+	expectedResults := []v1.PipelineRunResult{{Name: "parent-out", Value: *v1.NewStructuredValues("hello-from-child")}}
+	if d := cmp.Diff(expectedResults, reconciledRun.Status.Results); d != "" {
+		t.Errorf("Expected parent PipelineRun results to aggregate the child PipelineRun result. Diff %s", diff.PrintWantGot(d))
 	}
 }
