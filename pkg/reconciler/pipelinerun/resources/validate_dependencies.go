@@ -72,6 +72,9 @@ func validateResultRef(ref *v1.ResultRef, ptMap map[string]*ResolvedPipelineTask
 		// custom task executes.
 		return nil
 	}
+	if ptMap[ref.PipelineTask].IsChildPipeline() {
+		return validateChildPipelineResultRef(ref, ptMap[ref.PipelineTask])
+	}
 	if ptMap[ref.PipelineTask].ResolvedTask == nil || ptMap[ref.PipelineTask].ResolvedTask.TaskSpec == nil {
 		return fmt.Errorf("unable to validate result referencing pipeline task %q: task spec not found", ref.PipelineTask)
 	}
@@ -85,6 +88,21 @@ func validateResultRef(ref *v1.ResultRef, ptMap map[string]*ResolvedPipelineTask
 		return fmt.Errorf("%q is not a named result returned by pipeline task %q", ref.Result, ref.PipelineTask)
 	}
 	return nil
+}
+
+// validateChildPipelineResultRef validates a ResultRef pointing to a pipeline task that
+// runs a child Pipeline (Pipelines-in-Pipelines) against the results declared by the
+// child Pipeline's spec.
+func validateChildPipelineResultRef(ref *v1.ResultRef, rpt *ResolvedPipelineTask) error {
+	if rpt.ResolvedPipeline.PipelineSpec == nil {
+		return fmt.Errorf("unable to validate result referencing pipeline task %q: pipeline spec not found", ref.PipelineTask)
+	}
+	for _, pipelineResult := range rpt.ResolvedPipeline.PipelineSpec.Results {
+		if pipelineResult.Name == ref.Result {
+			return nil
+		}
+	}
+	return fmt.Errorf("%q is not a named result returned by pipeline task %q", ref.Result, ref.PipelineTask)
 }
 
 // ValidateOptionalWorkspaces validates that any workspaces in the Pipeline that are

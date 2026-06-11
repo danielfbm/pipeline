@@ -1154,6 +1154,336 @@ func TestValidateArrayResultsIndex(t *testing.T) {
 	}
 }
 
+// childPipelineRunState contains ResolvedPipelineTasks for child Pipelines
+// (Pipelines-in-Pipelines, TEP-0056) and tasks consuming their results.
+var childPipelineRunState = PipelineRunState{{
+	// 0: successful child Pipeline emitting string, array and object results
+	ChildPipelineRunNames: []string{"aChildPipelineRun"},
+	ChildPipelineRuns: []*v1.PipelineRun{{
+		ObjectMeta: metav1.ObjectMeta{Name: "aChildPipelineRun"},
+		Status: v1.PipelineRunStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{successCondition},
+			},
+			PipelineRunStatusFields: v1.PipelineRunStatusFields{
+				Results: []v1.PipelineRunResult{{
+					Name:  "aResult",
+					Value: *v1.NewStructuredValues("aChildResultValue"),
+				}, {
+					Name:  "arrayResult",
+					Value: *v1.NewStructuredValues("arrayResultOne", "arrayResultTwo"),
+				}, {
+					Name:  "objectResult",
+					Value: *v1.NewObject(map[string]string{"key1": "val1"}),
+				}},
+			},
+		},
+	}},
+	PipelineTask: &v1.PipelineTask{
+		Name:        "aChildPipelineTask",
+		PipelineRef: &v1.PipelineRef{Name: "aChildPipeline"},
+	},
+}, {
+	// 1: consumer of the child string result via params
+	PipelineTask: &v1.PipelineTask{
+		Name:    "bTask",
+		TaskRef: &v1.TaskRef{Name: "bTask"},
+		Params: []v1.Param{{
+			Name:  "bParam",
+			Value: *v1.NewStructuredValues("$(tasks.aChildPipelineTask.results.aResult)"),
+		}},
+	},
+}, {
+	// 2: consumer of the child array result via params - array indexing
+	PipelineTask: &v1.PipelineTask{
+		Name:    "cTask",
+		TaskRef: &v1.TaskRef{Name: "cTask"},
+		Params: []v1.Param{{
+			Name:  "cParam",
+			Value: *v1.NewStructuredValues("$(tasks.aChildPipelineTask.results.arrayResult[1])"),
+		}},
+	},
+}, {
+	// 3: consumer of the child object result via params
+	PipelineTask: &v1.PipelineTask{
+		Name:    "dTask",
+		TaskRef: &v1.TaskRef{Name: "dTask"},
+		Params: []v1.Param{{
+			Name:  "dParam",
+			Value: *v1.NewStructuredValues("$(tasks.aChildPipelineTask.results.objectResult.key1)"),
+		}},
+	},
+}, {
+	// 4: consumer of a result the child did not emit
+	PipelineTask: &v1.PipelineTask{
+		Name:    "eTask",
+		TaskRef: &v1.TaskRef{Name: "eTask"},
+		Params: []v1.Param{{
+			Name:  "eParam",
+			Value: *v1.NewStructuredValues("$(tasks.aChildPipelineTask.results.missingResult)"),
+		}},
+	},
+}, {
+	// 5: child Pipeline that has not finished (no succeeded condition)
+	ChildPipelineRunNames: []string{"unfinishedChildPipelineRun"},
+	ChildPipelineRuns: []*v1.PipelineRun{{
+		ObjectMeta: metav1.ObjectMeta{Name: "unfinishedChildPipelineRun"},
+	}},
+	PipelineTask: &v1.PipelineTask{
+		Name:        "unfinishedChildPipelineTask",
+		PipelineRef: &v1.PipelineRef{Name: "unfinishedChildPipeline"},
+	},
+}, {
+	// 6: consumer of a result from the unfinished child Pipeline
+	PipelineTask: &v1.PipelineTask{
+		Name:    "fTask",
+		TaskRef: &v1.TaskRef{Name: "fTask"},
+		Params: []v1.Param{{
+			Name:  "fParam",
+			Value: *v1.NewStructuredValues("$(tasks.unfinishedChildPipelineTask.results.aResult)"),
+		}},
+	},
+}, {
+	// 7: consumer of the child string result via when expressions
+	PipelineTask: &v1.PipelineTask{
+		Name:    "gTask",
+		TaskRef: &v1.TaskRef{Name: "gTask"},
+		When: []v1.WhenExpression{{
+			Input:    "$(tasks.aChildPipelineTask.results.aResult)",
+			Operator: selection.In,
+			Values:   []string{"$(tasks.aChildPipelineTask.results.aResult)"},
+		}},
+	},
+}, {
+	// 8: failed child Pipeline that still reported a result
+	ChildPipelineRunNames: []string{"failedChildPipelineRun"},
+	ChildPipelineRuns: []*v1.PipelineRun{{
+		ObjectMeta: metav1.ObjectMeta{Name: "failedChildPipelineRun"},
+		Status: v1.PipelineRunStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{failedCondition},
+			},
+			PipelineRunStatusFields: v1.PipelineRunStatusFields{
+				Results: []v1.PipelineRunResult{{
+					Name:  "hResult",
+					Value: *v1.NewStructuredValues("hChildResultValue"),
+				}},
+			},
+		},
+	}},
+	PipelineTask: &v1.PipelineTask{
+		Name:        "failedChildPipelineTask",
+		PipelineRef: &v1.PipelineRef{Name: "failedChildPipeline"},
+	},
+}, {
+	// 9: consumer of the failed child Pipeline result
+	PipelineTask: &v1.PipelineTask{
+		Name:    "iTask",
+		TaskRef: &v1.TaskRef{Name: "iTask"},
+		Params: []v1.Param{{
+			Name:  "iParam",
+			Value: *v1.NewStructuredValues("$(tasks.failedChildPipelineTask.results.hResult)"),
+		}},
+	},
+}, {
+	// 10: child Pipeline with zero-length ChildPipelineRuns
+	ChildPipelineRunNames: []string{"emptyChildPipelineRun"},
+	ChildPipelineRuns:     []*v1.PipelineRun{},
+	PipelineTask: &v1.PipelineTask{
+		Name:        "emptyChildPipelineTask",
+		PipelineRef: &v1.PipelineRef{Name: "emptyChildPipeline"},
+	},
+}, {
+	// 11: consumer of a result from the child Pipeline with zero-length ChildPipelineRuns
+	PipelineTask: &v1.PipelineTask{
+		Name:    "jTask",
+		TaskRef: &v1.TaskRef{Name: "jTask"},
+		Params: []v1.Param{{
+			Name:  "jParam",
+			Value: *v1.NewStructuredValues("$(tasks.emptyChildPipelineTask.results.aResult)"),
+		}},
+	},
+}}
+
+func TestResolveResultRefs_ChildPipeline(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		pipelineRunState PipelineRunState
+		targets          PipelineRunState
+		want             ResolvedResultRefs
+		wantErr          bool
+		wantErrSubstr    string
+		wantPt           string
+	}{{
+		name:             "Test successful child pipeline result references resolution - string result - params",
+		pipelineRunState: childPipelineRunState,
+		targets: PipelineRunState{
+			childPipelineRunState[1],
+		},
+		want: ResolvedResultRefs{{
+			Value: *v1.NewStructuredValues("aChildResultValue"),
+			ResultReference: v1.ResultRef{
+				PipelineTask: "aChildPipelineTask",
+				Result:       "aResult",
+			},
+			FromPipelineRun: "aChildPipelineRun",
+		}},
+		wantErr: false,
+	}, {
+		name:             "Test successful child pipeline result references resolution - array result - array indexing",
+		pipelineRunState: childPipelineRunState,
+		targets: PipelineRunState{
+			childPipelineRunState[2],
+		},
+		want: ResolvedResultRefs{{
+			Value: *v1.NewStructuredValues("arrayResultOne", "arrayResultTwo"),
+			ResultReference: v1.ResultRef{
+				PipelineTask: "aChildPipelineTask",
+				Result:       "arrayResult",
+				ResultsIndex: &idx1,
+			},
+			FromPipelineRun: "aChildPipelineRun",
+		}},
+		wantErr: false,
+	}, {
+		name:             "Test successful child pipeline result references resolution - object result",
+		pipelineRunState: childPipelineRunState,
+		targets: PipelineRunState{
+			childPipelineRunState[3],
+		},
+		want: ResolvedResultRefs{{
+			Value: *v1.NewObject(map[string]string{"key1": "val1"}),
+			ResultReference: v1.ResultRef{
+				PipelineTask: "aChildPipelineTask",
+				Result:       "objectResult",
+				Property:     "key1",
+			},
+			FromPipelineRun: "aChildPipelineRun",
+		}},
+		wantErr: false,
+	}, {
+		name:             "Test unsuccessful child pipeline result references resolution - missing result",
+		pipelineRunState: childPipelineRunState,
+		targets: PipelineRunState{
+			childPipelineRunState[4],
+		},
+		want:          nil,
+		wantErr:       true,
+		wantErrSubstr: "Could not find result with name",
+		wantPt:        "aChildPipelineTask",
+	}, {
+		name:             "Test unsuccessful child pipeline result references resolution - child pipeline not finished",
+		pipelineRunState: childPipelineRunState,
+		targets: PipelineRunState{
+			childPipelineRunState[6],
+		},
+		want:          nil,
+		wantErr:       true,
+		wantErrSubstr: "was not finished",
+		wantPt:        "unfinishedChildPipelineTask",
+	}, {
+		name:             "Test successful child pipeline result references resolution - when expressions",
+		pipelineRunState: childPipelineRunState,
+		targets: PipelineRunState{
+			childPipelineRunState[7],
+		},
+		want: ResolvedResultRefs{{
+			Value: *v1.NewStructuredValues("aChildResultValue"),
+			ResultReference: v1.ResultRef{
+				PipelineTask: "aChildPipelineTask",
+				Result:       "aResult",
+			},
+			FromPipelineRun: "aChildPipelineRun",
+		}},
+		wantErr: false,
+	}, {
+		name:             "Test successful child pipeline result references resolution - failed child pipelinerun",
+		pipelineRunState: childPipelineRunState,
+		targets: PipelineRunState{
+			childPipelineRunState[9],
+		},
+		want: ResolvedResultRefs{{
+			Value: *v1.NewStructuredValues("hChildResultValue"),
+			ResultReference: v1.ResultRef{
+				PipelineTask: "failedChildPipelineTask",
+				Result:       "hResult",
+			},
+			FromPipelineRun: "failedChildPipelineRun",
+		}},
+		wantErr: false,
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, pt, err := ResolveResultRefs(tt.pipelineRunState, tt.targets)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ResolveResultRefs() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if err != nil && tt.wantErrSubstr != "" && !strings.Contains(err.Error(), tt.wantErrSubstr) {
+				t.Errorf("ResolveResultRefs() error = %v, want error containing %q", err, tt.wantErrSubstr)
+			}
+			if d := cmp.Diff(tt.want, got, cmpopts.SortSlices(lessResolvedResultRefs)); d != "" {
+				t.Fatalf("ResolveResultRef %s", diff.PrintWantGot(d))
+			}
+			if d := cmp.Diff(tt.wantPt, pt); d != "" {
+				t.Fatalf("ResolvedPipelineTask %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestCheckMissingResultReferences_ChildPipeline(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		pipelineRunState PipelineRunState
+		target           *ResolvedPipelineTask
+		wantErr          string
+	}{{
+		name:             "Valid: result present in child pipelinerun status results",
+		pipelineRunState: childPipelineRunState,
+		target:           childPipelineRunState[1],
+	}, {
+		name:             "Invalid: child pipeline task with zero-length ChildPipelineRuns",
+		pipelineRunState: childPipelineRunState,
+		target:           childPipelineRunState[11],
+		wantErr:          `Result reference error: Internal result ref "emptyChildPipelineTask" has zero-length ChildPipelineRuns`,
+	}, {
+		name:             "Invalid: successful child pipeline missing the referenced result",
+		pipelineRunState: childPipelineRunState,
+		target:           childPipelineRunState[4],
+		wantErr:          `task "aChildPipelineTask" completed successfully but did not emit the result "missingResult", which is referenced by task "eTask"`,
+	}, {
+		name:             "Invalid: failed child pipeline missing the referenced result uses original error",
+		pipelineRunState: childPipelineRunState,
+		target: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				Name:    "consumer",
+				TaskRef: &v1.TaskRef{Name: "consumer-task"},
+				Params: []v1.Param{{
+					Name:  "input",
+					Value: *v1.NewStructuredValues("$(tasks.failedChildPipelineTask.results.missingResult)"),
+				}},
+			},
+		},
+		wantErr: "Invalid task result reference: Could not find result with name missingResult for pipeline task failedChildPipelineTask",
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CheckMissingResultReferences(tt.pipelineRunState, tt.target)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("CheckMissingResultReferences() unexpected error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("CheckMissingResultReferences() expected error %q but got nil", tt.wantErr)
+				}
+				if err.Error() != tt.wantErr {
+					t.Errorf("CheckMissingResultReferences() error = %q, want %q", err.Error(), tt.wantErr)
+				}
+			}
+		})
+	}
+}
+
 func TestParamValueFromCustomRunResult(t *testing.T) {
 	type args struct {
 		result string
