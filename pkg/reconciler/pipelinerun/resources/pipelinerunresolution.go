@@ -1045,7 +1045,24 @@ func CheckMissingResultReferences(pipelineRunState PipelineRunState, target *Res
 		if !ok {
 			return fmt.Errorf("Result reference error: Could not find ref \"%s\" in internal pipelineRunState", resultRef.PipelineTask)
 		}
-		if referencedPipelineTask.IsCustomTask() {
+		switch {
+		case referencedPipelineTask.IsChildPipeline():
+			if len(referencedPipelineTask.ChildPipelineRuns) == 0 {
+				return fmt.Errorf("Result reference error: Internal result ref \"%s\" has zero-length ChildPipelineRuns", resultRef.PipelineTask)
+			}
+			childPipelineRun := referencedPipelineTask.ChildPipelineRuns[0]
+			_, err := findChildPipelineRunResultForParam(childPipelineRun, resultRef)
+			if err != nil {
+				if referencedPipelineTask.isSuccessful() {
+					return &MissingResultFromCompletedTaskError{
+						Task:   resultRef.PipelineTask,
+						Result: resultRef.Result,
+						Target: target.PipelineTask.Name,
+					}
+				}
+				return err
+			}
+		case referencedPipelineTask.IsCustomTask():
 			if len(referencedPipelineTask.CustomRuns) == 0 {
 				return fmt.Errorf("Result reference error: Internal result ref \"%s\" has zero-length CustomRuns", resultRef.PipelineTask)
 			}
@@ -1061,7 +1078,7 @@ func CheckMissingResultReferences(pipelineRunState PipelineRunState, target *Res
 				}
 				return err
 			}
-		} else {
+		default:
 			if len(referencedPipelineTask.TaskRuns) == 0 {
 				return fmt.Errorf("Result reference error: Internal result ref \"%s\" has zero-length TaskRuns", resultRef.PipelineTask)
 			}

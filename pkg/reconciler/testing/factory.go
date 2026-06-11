@@ -1278,3 +1278,148 @@ spec:
 
 	return parentPipeline, resolvedChild, parentPipelineRun, expectedChildPipelineRun
 }
+
+// PipelineRefInPipelineWithResults creates a parent Pipeline whose pipelineRef
+// child emits a result that is consumed by a later parent task (param and when
+// expression), guards a never-running task with a false when expression on the
+// same result, and re-emits the child result as a parent pipeline result. It
+// returns (parentPipeline, childPipeline, parentPipelineRun, expectedChildPipelineRun).
+func PipelineRefInPipelineWithResults(t *testing.T, namespace, parentPipelineRunName string) (*v1.Pipeline, *v1.Pipeline, *v1.PipelineRun, *v1.PipelineRun) {
+	t.Helper()
+	parentPipelineName := "parent-pipeline-results"
+	childPipelineName := "child-pipeline-results"
+
+	childPipeline := parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  tasks:
+  - name: produce
+    taskSpec:
+      results:
+      - name: message
+      steps:
+      - name: write
+        image: mirror.gcr.io/busybox
+        script: 'printf "hello-from-child" > $(results.message.path)'
+  results:
+  - name: message
+    value: $(tasks.produce.results.message)
+`, childPipelineName, namespace))
+
+	parentPipeline := parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  tasks:
+  - name: child
+    pipelineRef:
+      name: %s
+  - name: consume
+    params:
+    - name: message
+      value: $(tasks.child.results.message)
+    when:
+    - input: $(tasks.child.results.message)
+      operator: in
+      values: ["hello-from-child"]
+    taskSpec:
+      params:
+      - name: message
+      steps:
+      - name: check
+        image: mirror.gcr.io/busybox
+        script: |
+          test "$(params.message)" = "hello-from-child"
+  - name: never-runs
+    when:
+    - input: $(tasks.child.results.message)
+      operator: notin
+      values: ["hello-from-child"]
+    taskSpec:
+      steps:
+      - name: echo
+        image: mirror.gcr.io/busybox
+        script: 'echo "should have been skipped"'
+  results:
+  - name: child-message
+    value: $(tasks.child.results.message)
+`, parentPipelineName, namespace, childPipelineName))
+
+	parentPipelineRun := parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  pipelineRef:
+    name: %s
+`, parentPipelineRunName, namespace, parentPipelineName))
+
+	expectedChildPipelineRun := parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    tekton.dev/pipeline: %s
+`, parentPipelineRunName+"-child", namespace, childPipelineName))
+
+	return parentPipeline, childPipeline, parentPipelineRun, expectedChildPipelineRun
+}
+
+// PipelineRefInPipelineMissingResult creates a parent Pipeline whose consumer
+// task references a result that the (successful) child Pipeline never produces.
+// It returns (parentPipeline, childPipeline, parentPipelineRun).
+func PipelineRefInPipelineMissingResult(t *testing.T, namespace, parentPipelineRunName string) (*v1.Pipeline, *v1.Pipeline, *v1.PipelineRun) {
+	t.Helper()
+	parentPipelineName := "parent-pipeline-missing-result"
+	childPipelineName := "child-pipeline-no-results"
+
+	childPipeline := parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  tasks:
+  - name: produce
+    taskSpec:
+      steps:
+      - name: noop
+        image: mirror.gcr.io/busybox
+        script: 'echo "no results here"'
+`, childPipelineName, namespace))
+
+	parentPipeline := parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  tasks:
+  - name: child
+    pipelineRef:
+      name: %s
+  - name: consume
+    params:
+    - name: message
+      value: $(tasks.child.results.message)
+    taskSpec:
+      params:
+      - name: message
+      steps:
+      - name: echo
+        image: mirror.gcr.io/busybox
+        script: 'echo "$(params.message)"'
+`, parentPipelineName, namespace, childPipelineName))
+
+	parentPipelineRun := parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  pipelineRef:
+    name: %s
+`, parentPipelineRunName, namespace, parentPipelineName))
+
+	return parentPipeline, childPipeline, parentPipelineRun
+}

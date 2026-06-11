@@ -965,3 +965,94 @@ func TestPipelineRun_PinP_PipelineRefInFinally(t *testing.T) {
 	assertPinP(ctx, t, c, expectedChildPR)
 	assertEvents(ctx, t, expectedEventsAmount, expectedKinds, c, namespace)
 }
+
+// @test:execution=parallel
+// TestPipelineRun_PinP_ResultsPropagation verifies end-to-end results
+// propagation from a child Pipeline: the child PipelineRun's result is consumed
+// by a later parent task as a param (validated in-container), drives when
+// expressions (true -> task runs, false -> task skipped), and is re-emitted as
+// a parent pipeline result on the parent PipelineRun's status.results.
+func TestPipelineRun_PinP_ResultsPropagation(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c, namespace := setup(ctx, t, requireAnyGate(map[string]string{
+		"enable-api-fields": "alpha",
+	}))
+	knativetest.CleanupOnInterrupt(func() { tearDown(ctx, t, c, namespace) }, t.Logf)
+	defer tearDown(ctx, t, c, namespace)
+
+	// GIVEN: a child Pipeline that emits a result and a parent that consumes it.
+	parentPipeline, childPipeline, parentPipelineRun, expectedChildPR :=
+		th.PipelineRefInPipelineWithResults(t, namespace, "pr-pinp-results")
+
+	// WHEN: the parent only succeeds if the consumer task's in-container check of
+	// the propagated result value passes.
+	createResourcesAndWaitForPipelineRunSuccess(ctx, t, c, namespace, []*v1.Pipeline{parentPipeline, childPipeline}, parentPipelineRun, nil)
+
+	// THEN: the child PipelineRun succeeded.
+	assertPinP(ctx, t, c, expectedChildPR)
+
+	parentPr, err := c.V1PipelineRunClient.Get(ctx, parentPipelineRun.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Error getting parent PipelineRun %s: %s", parentPipelineRun.Name, err)
+	}
+
+	// The child result propagated into the parent PipelineRun's results.
+	expectedResults := []v1.PipelineRunResult{{
+		Name:  "child-message",
+		Value: *v1.NewStructuredValues("hello-from-child"),
+	}}
+	if diff := cmp.Diff(expectedResults, parentPr.Status.Results); diff != "" {
+		t.Errorf("Unexpected parent PipelineRun results (-want, +got): %s", diff)
+	}
+
+	// The when expression guarded by the child result skipped the never-runs task.
+	skipped := false
+	for _, st := range parentPr.Status.SkippedTasks {
+		if st.Name == "never-runs" {
+			skipped = true
+			if st.Reason != v1.WhenExpressionsSkip {
+				t.Errorf("Expected never-runs to be skipped due to when expressions, got reason %q", st.Reason)
+			}
+		}
+	}
+	if !skipped {
+		t.Errorf("Expected task never-runs to be listed in skippedTasks, got: %+v", parentPr.Status.SkippedTasks)
+	}
+
+	// The consumer TaskRun was created (when expression evaluated to true).
+	consumerTrName := kmeta.ChildName(parentPipelineRun.Name, "-consume")
+	if _, err := c.V1TaskRunClient.Get(ctx, consumerTrName, metav1.GetOptions{}); err != nil {
+		t.Errorf("Expected consumer TaskRun %s to exist: %s", consumerTrName, err)
+	}
+}
+
+// @test:execution=parallel
+// TestPipelineRun_PinP_ResultsMissingFails verifies that referencing a result
+// the child Pipeline does not declare fails the parent PipelineRun through real
+// reconciliation rather than hanging or panicking.
+func TestPipelineRun_PinP_ResultsMissingFails(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c, namespace := setup(ctx, t, requireAnyGate(map[string]string{
+		"enable-api-fields": "alpha",
+	}))
+	knativetest.CleanupOnInterrupt(func() { tearDown(ctx, t, c, namespace) }, t.Logf)
+	defer tearDown(ctx, t, c, namespace)
+
+	// GIVEN: the consumer references $(tasks.child.results.message) but the child
+	// Pipeline declares no results at all.
+	parentPipeline, childPipeline, parentPipelineRun :=
+		th.PipelineRefInPipelineMissingResult(t, namespace, "pr-pinp-missing-result")
+
+	// WHEN
+	createResourcesAndWaitForPipelineRunFailed(ctx, t, c, namespace, []*v1.Pipeline{parentPipeline, childPipeline}, parentPipelineRun, nil)
+
+	// THEN: the parent fails fast because the referenced result is not declared
+	// by the child Pipeline.
+	assertFailureMessage(ctx, t, c, parentPipelineRun.Name, `"message" is not a named result returned by pipeline task "child"`)
+}

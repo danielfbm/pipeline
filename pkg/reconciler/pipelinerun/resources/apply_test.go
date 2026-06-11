@@ -4244,7 +4244,7 @@ func TestApplyFinallyResultsToPipelineResults(t *testing.T) {
 		},
 	} {
 		t.Run(tc.description, func(t *testing.T) {
-			received, _ := resources.ApplyTaskResultsToPipelineResults(tc.results, tc.taskResults, tc.runResults, nil /* skippedTasks */)
+			received, _ := resources.ApplyTaskResultsToPipelineResults(tc.results, tc.taskResults, tc.runResults, nil /* childPipelineRunResults */, nil /* skippedTasks */)
 			if d := cmp.Diff(tc.expected, received); d != "" {
 				t.Error(diff.PrintWantGot(d))
 			}
@@ -4258,6 +4258,7 @@ func TestApplyTaskResultsToPipelineResults_Success(t *testing.T) {
 		results         []v1.PipelineResult
 		taskResults     map[string][]v1.TaskRunResult
 		runResults      map[string][]v1beta1.CustomRunResult
+		childResults    map[string][]v1.PipelineRunResult
 		taskstatus      map[string]string
 		skippedTasks    []v1.SkippedTask
 		expectedResults []v1.PipelineRunResult
@@ -4575,9 +4576,108 @@ func TestApplyTaskResultsToPipelineResults_Success(t *testing.T) {
 			Name:  "foo",
 			Value: *v1.NewStructuredValues("do", "rae", "mi"),
 		}},
+	}, {
+		description: "string-result-from-child-pipeline",
+		results: []v1.PipelineResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("$(tasks.child-pipeline.results.foo)"),
+		}},
+		childResults: map[string][]v1.PipelineRunResult{
+			"child-pipeline": {{
+				Name:  "foo",
+				Value: *v1.NewStructuredValues("do"),
+			}},
+		},
+		expectedResults: []v1.PipelineRunResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("do"),
+		}},
+	}, {
+		description: "array-result-from-child-pipeline",
+		results: []v1.PipelineResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("$(tasks.child-pipeline.results.foo[*])"),
+		}, {
+			Name:  "pipeline-result-2",
+			Value: *v1.NewStructuredValues("$(tasks.child-pipeline.results.foo[0])"),
+		}},
+		childResults: map[string][]v1.PipelineRunResult{
+			"child-pipeline": {{
+				Name:  "foo",
+				Value: *v1.NewStructuredValues("do", "rae"),
+			}},
+		},
+		expectedResults: []v1.PipelineRunResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("do", "rae"),
+		}, {
+			Name:  "pipeline-result-2",
+			Value: *v1.NewStructuredValues("do"),
+		}},
+	}, {
+		description: "object-result-from-child-pipeline",
+		results: []v1.PipelineResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("$(tasks.child-pipeline.results.foo[*])"),
+		}, {
+			Name:  "pipeline-result-2",
+			Value: *v1.NewStructuredValues("$(tasks.child-pipeline.results.foo.key1)"),
+		}},
+		childResults: map[string][]v1.PipelineRunResult{
+			"child-pipeline": {{
+				Name: "foo",
+				Value: *v1.NewObject(map[string]string{
+					"key1": "val1",
+					"key2": "val2",
+				}),
+			}},
+		},
+		expectedResults: []v1.PipelineRunResult{{
+			Name: "pipeline-result-1",
+			Value: *v1.NewObject(map[string]string{
+				"key1": "val1",
+				"key2": "val2",
+			}),
+		}, {
+			Name:  "pipeline-result-2",
+			Value: *v1.NewStructuredValues("val1"),
+		}},
+	}, {
+		description: "missing-result-from-unsuccessful-child-pipeline-omitted",
+		results: []v1.PipelineResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("$(tasks.child-pipeline.results.foo)"),
+		}},
+		childResults: map[string][]v1.PipelineRunResult{
+			"child-pipeline": {},
+		},
+		taskstatus:      map[string]string{resources.PipelineTaskStatusPrefix + "child-pipeline" + resources.PipelineTaskStatusSuffix: v1beta1.TaskRunReasonFailed.String()},
+		expectedResults: nil,
+	}, {
+		description: "task-run-results-take-precedence-over-child-pipeline-results",
+		results: []v1.PipelineResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("$(tasks.pt1.results.foo)"),
+		}},
+		taskResults: map[string][]v1.TaskRunResult{
+			"pt1": {{
+				Name:  "foo",
+				Value: *v1.NewStructuredValues("from-taskrun"),
+			}},
+		},
+		childResults: map[string][]v1.PipelineRunResult{
+			"pt1": {{
+				Name:  "foo",
+				Value: *v1.NewStructuredValues("from-child-pipeline"),
+			}},
+		},
+		expectedResults: []v1.PipelineRunResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("from-taskrun"),
+		}},
 	}} {
 		t.Run(tc.description, func(t *testing.T) {
-			received, err := resources.ApplyTaskResultsToPipelineResults(tc.results, tc.taskResults, tc.runResults, tc.taskstatus)
+			received, err := resources.ApplyTaskResultsToPipelineResults(tc.results, tc.taskResults, tc.runResults, tc.childResults, tc.taskstatus)
 			if err != nil {
 				t.Errorf("Got unexpected error:%v", err)
 			}
@@ -4594,6 +4694,7 @@ func TestApplyTaskResultsToPipelineResults_Error(t *testing.T) {
 		results         []v1.PipelineResult
 		taskResults     map[string][]v1.TaskRunResult
 		runResults      map[string][]v1beta1.CustomRunResult
+		childResults    map[string][]v1.PipelineRunResult
 		expectedResults []v1.PipelineRunResult
 		expectedError   error
 	}{{
@@ -4791,9 +4892,54 @@ func TestApplyTaskResultsToPipelineResults_Error(t *testing.T) {
 		},
 		expectedResults: nil,
 		expectedError:   errors.New("invalid pipelineresults [foo], the referenced results don't exist"),
+	}, {
+		description: "child-pipeline-array-index-out-of-bound",
+		results: []v1.PipelineResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("$(tasks.child-pipeline.results.foo[4])"),
+		}},
+		childResults: map[string][]v1.PipelineRunResult{
+			"child-pipeline": {{
+				Name:  "foo",
+				Value: *v1.NewStructuredValues("do", "rae", "mi"),
+			}},
+		},
+		expectedResults: nil,
+		expectedError:   errors.New("invalid pipelineresults [pipeline-result-1], the referenced results don't exist"),
+	}, {
+		description: "child-pipeline-object-reference-key-not-exist",
+		results: []v1.PipelineResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("$(tasks.child-pipeline.results.foo.key3)"),
+		}},
+		childResults: map[string][]v1.PipelineRunResult{
+			"child-pipeline": {{
+				Name: "foo",
+				Value: *v1.NewObject(map[string]string{
+					"key1": "val1",
+					"key2": "val2",
+				}),
+			}},
+		},
+		expectedResults: nil,
+		expectedError:   errors.New("invalid pipelineresults [pipeline-result-1], the referenced results don't exist"),
+	}, {
+		description: "missing-result-from-successful-child-pipeline",
+		results: []v1.PipelineResult{{
+			Name:  "pipeline-result-1",
+			Value: *v1.NewStructuredValues("$(tasks.child-pipeline.results.foo)"),
+		}},
+		childResults: map[string][]v1.PipelineRunResult{
+			"child-pipeline": {{
+				Name:  "notfoo",
+				Value: *v1.NewStructuredValues("bar"),
+			}},
+		},
+		expectedResults: nil,
+		expectedError:   errors.New("invalid pipelineresults [pipeline-result-1], the referenced results don't exist"),
 	}} {
 		t.Run(tc.description, func(t *testing.T) {
-			received, err := resources.ApplyTaskResultsToPipelineResults(tc.results, tc.taskResults, tc.runResults, nil /*skipped tasks*/)
+			received, err := resources.ApplyTaskResultsToPipelineResults(tc.results, tc.taskResults, tc.runResults, tc.childResults, nil /*skipped tasks*/)
 			if err == nil {
 				t.Errorf("Expect error but got nil")
 				return

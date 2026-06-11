@@ -967,6 +967,7 @@ func (c *Reconciler) reconcile(ctx context.Context, pr *v1.PipelineRun, getPipel
 			pipelineSpec.Results,
 			pipelineRunFacts.State.GetTaskRunsResults(),
 			pipelineRunFacts.State.GetRunsResults(),
+			pipelineRunFacts.State.GetChildPipelineRunResults(),
 			pipelineTaskStatus,
 		)
 		if err != nil {
