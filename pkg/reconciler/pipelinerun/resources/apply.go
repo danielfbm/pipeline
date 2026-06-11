@@ -663,7 +663,7 @@ func PropagateResults(rpt *ResolvedPipelineTask, runStates PipelineRunState) {
 	}
 	stringReplacements := map[string]string{}
 	arrayReplacements := map[string][]string{}
-	for taskName, taskResults := range runStates.GetTaskRunsResults() {
+	for taskName, taskResults := range runStates.GetTaskRunsAndChildPipelineRunsResults() {
 		for _, res := range taskResults {
 			switch res.Type {
 			case v1.ResultsTypeString:

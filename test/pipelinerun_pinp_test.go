@@ -325,6 +325,46 @@ func TestPipelineRun_PinP_TwoLevelDeepNestedChildPipelineRunsWithPipelineRef(t *
 	assertEvents(ctx, t, expectedEventsAmount, expectedKinds, c, namespace)
 }
 
+// @test:execution=parallel
+// TestPipelineRun_PinP_ResultsPropagation verifies end-to-end that results produced by a
+// child Pipeline (Pipelines in Pipelines) propagate to the parent: consumed in a downstream
+// task's params and when-expression, and aggregated into the parent PipelineRun's
+// status.results. The downstream "consumer" task asserts the value at runtime, so a
+// successful run already proves param + when propagation; the status.results check proves
+// aggregation.
+func TestPipelineRun_PinP_ResultsPropagation(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c, namespace := setup(ctx, t, requireAnyGate(map[string]string{
+		"enable-api-fields": "alpha",
+	}))
+	knativetest.CleanupOnInterrupt(func() { tearDown(ctx, t, c, namespace) }, t.Logf)
+	defer tearDown(ctx, t, c, namespace)
+
+	// GIVEN
+	t.Logf("Setting up child-Pipeline results propagation resources in namespace %q", namespace)
+	parentPipeline, childPipeline, parentPipelineRun, expectedChildPipelineRun, wantResults :=
+		th.OnePipelineRefInPipelineWithResults(t, namespace, "parent-pipeline-results")
+
+	// WHEN: the parent only succeeds if the consumer's runtime assertion on the
+	// propagated child-Pipeline result (param + when) passes.
+	createResourcesAndWaitForPipelineRunSuccess(ctx, t, c, namespace, []*v1.Pipeline{parentPipeline, childPipeline}, parentPipelineRun, nil)
+
+	// THEN: the child PipelineRun succeeded, and the child result was aggregated into
+	// the parent PipelineRun's status.results.
+	assertPinP(ctx, t, c, expectedChildPipelineRun)
+
+	parent, err := c.V1PipelineRunClient.Get(ctx, parentPipelineRun.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Error getting parent PipelineRun %s: %s", parentPipelineRun.Name, err)
+	}
+	if d := cmp.Diff(wantResults, parent.Status.Results); d != "" {
+		t.Fatalf("child Pipeline result not aggregated into parent status.results (-want, +got): %s", d)
+	}
+}
+
 // assertFailureMessage fetches the named PipelineRun and asserts that its
 // Succeeded condition is false and that the condition message contains the
 // given substring.

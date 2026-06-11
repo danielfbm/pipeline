@@ -3680,6 +3680,79 @@ func TestPipelineRunState_GetResultsFuncs(t *testing.T) {
 				PipelineRunStatusFields: v1.PipelineRunStatusFields{},
 			},
 		}},
+	}, {
+		// Child Pipeline (Pipelines in Pipelines) that completed successfully and
+		// produced string, array and object results.
+		ChildPipelineRunNames: []string{"successful-child-pipeline-with-results"},
+		PipelineTask: &v1.PipelineTask{
+			Name:        "successful-child-pipeline-with-results-1",
+			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+		},
+		ChildPipelineRuns: []*v1.PipelineRun{{
+			Status: v1.PipelineRunStatus{
+				Status: duckv1.Status{Conditions: []apis.Condition{{
+					Type:   apis.ConditionSucceeded,
+					Status: corev1.ConditionTrue,
+				}}},
+				PipelineRunStatusFields: v1.PipelineRunStatusFields{
+					Results: []v1.PipelineRunResult{{
+						Name:  "foo",
+						Value: *v1.NewStructuredValues("oof"),
+					}, {
+						Name:  "list",
+						Value: *v1.NewStructuredValues("a", "b"),
+					}, {
+						Name:  "obj",
+						Value: *v1.NewObject(map[string]string{"k": "v"}),
+					}},
+				},
+			},
+		}},
+	}, {
+		// Child Pipeline that has failed but produced a result; isFailure() is true
+		// (ConditionSucceeded=False), so its results are still collected, consistent
+		// with TaskRun/CustomRun behavior.
+		ChildPipelineRunNames: []string{"failed-child-pipeline-with-results"},
+		PipelineTask: &v1.PipelineTask{
+			Name:        "failed-child-pipeline-with-results-1",
+			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+		},
+		ChildPipelineRuns: []*v1.PipelineRun{{
+			Status: v1.PipelineRunStatus{
+				Status: duckv1.Status{Conditions: []apis.Condition{{
+					Type:   apis.ConditionSucceeded,
+					Status: corev1.ConditionFalse,
+				}}},
+				PipelineRunStatusFields: v1.PipelineRunStatusFields{
+					Results: []v1.PipelineRunResult{{
+						Name:  "fail-foo",
+						Value: *v1.NewStructuredValues("fail-oof"),
+					}},
+				},
+			},
+		}},
+	}, {
+		// Child Pipeline still running: not successful nor failed, so it must be
+		// excluded from the results map.
+		ChildPipelineRunNames: []string{"running-child-pipeline"},
+		PipelineTask: &v1.PipelineTask{
+			Name:        "running-child-pipeline-1",
+			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+		},
+		ChildPipelineRuns: []*v1.PipelineRun{{
+			Status: v1.PipelineRunStatus{
+				Status: duckv1.Status{Conditions: []apis.Condition{{
+					Type:   apis.ConditionSucceeded,
+					Status: corev1.ConditionUnknown,
+				}}},
+				PipelineRunStatusFields: v1.PipelineRunStatusFields{
+					Results: []v1.PipelineRunResult{{
+						Name:  "not-ready",
+						Value: *v1.NewStructuredValues("nope"),
+					}},
+				},
+			},
+		}},
 	}}
 
 	expectedTaskResults := map[string][]v1.TaskRunResult{
@@ -3744,6 +3817,48 @@ func TestPipelineRunState_GetResultsFuncs(t *testing.T) {
 	}
 	if d := cmp.Diff(actualRunResults, expectedRunResults, cmpopts.SortSlices(sortCustomRunResults)); d != "" {
 		t.Errorf("Didn't get expected Run results map: %s", diff.PrintWantGot(d))
+	}
+
+	// Child Pipeline (Pipelines in Pipelines) results: only completed (successful or
+	// failed) child PipelineRuns that produced results are included; the running child
+	// and the successful child without results are excluded.
+	expectedChildPipelineRunResults := map[string][]v1.TaskRunResult{
+		"successful-child-pipeline-with-results-1": {{
+			Name:  "foo",
+			Type:  v1.ResultsTypeString,
+			Value: *v1.NewStructuredValues("oof"),
+		}, {
+			Name:  "list",
+			Type:  v1.ResultsTypeArray,
+			Value: *v1.NewStructuredValues("a", "b"),
+		}, {
+			Name:  "obj",
+			Type:  v1.ResultsTypeObject,
+			Value: *v1.NewObject(map[string]string{"k": "v"}),
+		}},
+		"failed-child-pipeline-with-results-1": {{
+			Name:  "fail-foo",
+			Type:  v1.ResultsTypeString,
+			Value: *v1.NewStructuredValues("fail-oof"),
+		}},
+	}
+	actualChildPipelineRunResults := state.GetChildPipelineRunsResults()
+	if d := cmp.Diff(expectedChildPipelineRunResults, actualChildPipelineRunResults, cmpopts.SortSlices(sortTaskRunResults)); d != "" {
+		t.Errorf("Didn't get expected child PipelineRun results map: %s", diff.PrintWantGot(d))
+	}
+
+	// The union helper merges TaskRun and child PipelineRun results into a single map;
+	// task names are unique across regular tasks and child pipelines, so neither set is lost.
+	actualUnion := state.GetTaskRunsAndChildPipelineRunsResults()
+	for ptName, want := range expectedTaskResults {
+		if d := cmp.Diff(want, actualUnion[ptName], cmpopts.SortSlices(sortTaskRunResults)); d != "" {
+			t.Errorf("union map missing TaskRun results for %q: %s", ptName, diff.PrintWantGot(d))
+		}
+	}
+	for ptName, want := range expectedChildPipelineRunResults {
+		if d := cmp.Diff(want, actualUnion[ptName], cmpopts.SortSlices(sortTaskRunResults)); d != "" {
+			t.Errorf("union map missing child PipelineRun results for %q: %s", ptName, diff.PrintWantGot(d))
+		}
 	}
 }
 

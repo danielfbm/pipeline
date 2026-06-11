@@ -965,7 +965,7 @@ func (c *Reconciler) reconcile(ctx context.Context, pr *v1.PipelineRun, getPipel
 	if after.Status == corev1.ConditionTrue || after.Status == corev1.ConditionFalse {
 		pr.Status.Results, err = resources.ApplyTaskResultsToPipelineResults(
 			pipelineSpec.Results,
-			pipelineRunFacts.State.GetTaskRunsResults(),
+			pipelineRunFacts.State.GetTaskRunsAndChildPipelineRunsResults(),
 			pipelineRunFacts.State.GetRunsResults(),
 			pipelineTaskStatus,
 		)
@@ -1060,7 +1060,7 @@ func (c *Reconciler) runNextSchedulableTask(ctx context.Context, pr *v1.Pipeline
 		c.setFinallyStartedTimeIfNeeded(pr, pipelineRunFacts)
 	}
 
-	resources.ApplyResultsToWorkspaceBindings(pipelineRunFacts.State.GetTaskRunsResults(), pr)
+	resources.ApplyResultsToWorkspaceBindings(pipelineRunFacts.State.GetTaskRunsAndChildPipelineRunsResults(), pr)
 
 	for _, rpt := range nextRpts {
 		if rpt.IsFinalTask(pipelineRunFacts) {

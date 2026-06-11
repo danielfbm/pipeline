@@ -1,0 +1,97 @@
+# Pipelines-in-Pipelines example: propagating string, array and object results
+# from a child Pipeline and consuming them in the parent via params, an array
+# index, an object key, a when-expression, and parent-level results.
+# Requires the alpha feature flag (enable-api-fields: alpha) to be set on the cluster.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: analyze-pipeline
+spec:
+  description: Child Pipeline producing string, array and object results.
+  results:
+    - name: report
+      value: $(tasks.scan.results.report)
+    - name: tags
+      type: array
+      value: $(tasks.scan.results.tags[*])
+    - name: meta
+      type: object
+      value: $(tasks.scan.results.meta[*])
+  tasks:
+    - name: scan
+      taskSpec:
+        results:
+          - name: report
+            type: string
+          - name: tags
+            type: array
+          - name: meta
+            type: object
+            properties:
+              severity: {}
+              owner: {}
+        steps:
+          - name: scan
+            image: mirror.gcr.io/busybox
+            script: |
+              printf 'clean' | tee "$(results.report.path)"
+              printf '["a","b"]' | tee "$(results.tags.path)"
+              printf '{"severity":"low","owner":"team-x"}' | tee "$(results.meta.path)"
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: analyze-and-gate
+spec:
+  description: Parent Pipeline consuming child Pipeline results in params, when, and results.
+  results:
+    - name: report
+      value: $(tasks.analyze.results.report)
+    - name: first-tag
+      value: $(tasks.analyze.results.tags[0])
+    - name: severity
+      value: $(tasks.analyze.results.meta.severity)
+  tasks:
+    - name: analyze
+      pipelineRef:
+        name: analyze-pipeline
+    - name: gate
+      runAfter:
+        - analyze
+      when:
+        - input: $(tasks.analyze.results.report)
+          operator: in
+          values:
+            - clean
+      taskSpec:
+        steps:
+          - name: ok
+            image: mirror.gcr.io/busybox
+            script: 'echo "report is clean; proceeding"'
+    - name: consume
+      runAfter:
+        - analyze
+      params:
+        - name: tag
+          value: $(tasks.analyze.results.tags[1])
+        - name: owner
+          value: $(tasks.analyze.results.meta.owner)
+      taskSpec:
+        params:
+          - name: tag
+          - name: owner
+        steps:
+          - name: verify
+            image: mirror.gcr.io/busybox
+            script: |
+              echo "tag=$(params.tag) owner=$(params.owner)"
+              test "$(params.tag)" = "b"
+              test "$(params.owner)" = "team-x"
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: pipelines-in-pipelines-results-complex-run-
+spec:
+  pipelineRef:
+    name: analyze-and-gate

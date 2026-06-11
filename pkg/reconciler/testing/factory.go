@@ -549,6 +549,111 @@ spec:
 	return parentPipeline, childPipeline, parentPipelineRun, expectedChildPipelineRun
 }
 
+// OnePipelineRefInPipelineWithResults builds a child Pipeline that produces a string result
+// ("out") and a parent Pipeline that consumes that child-Pipeline result three ways: in a
+// downstream task's params, in that task's when-expression, and as a parent-level Pipeline
+// result. It returns (parentPipeline, childPipeline, parentPipelineRun, expectedChildPipelineRun,
+// wantResults) where wantResults is the expected parent PipelineRun status.results after a
+// successful run. The downstream "consumer" task asserts the propagated value at runtime, so the
+// parent only succeeds if param + when propagation worked; wantResults covers status aggregation.
+func OnePipelineRefInPipelineWithResults(t *testing.T, namespace, parentPipelineRunName string) (*v1.Pipeline, *v1.Pipeline, *v1.PipelineRun, *v1.PipelineRun, []v1.PipelineRunResult) {
+	t.Helper()
+	uid := "bar"
+	parentPipelineName := "parent-pipeline"
+	childPipelineName := "child-pipeline"
+	const resultValue = "child-value"
+
+	childPipeline := parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  results:
+  - name: out
+    value: $(tasks.build.results.digest)
+  tasks:
+  - name: build
+    taskSpec:
+      results:
+      - name: digest
+      steps:
+      - name: emit
+        image: mirror.gcr.io/busybox
+        script: 'printf %s | tee "$(results.digest.path)"'
+`, childPipelineName, namespace, resultValue))
+
+	parentPipeline := parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  results:
+  - name: propagated
+    value: $(tasks.%s.results.out)
+  tasks:
+  - name: %s
+    pipelineRef:
+      name: %s
+  - name: consumer
+    runAfter: [%s]
+    when:
+    - input: $(tasks.%s.results.out)
+      operator: in
+      values: [%s]
+    params:
+    - name: msg
+      value: $(tasks.%s.results.out)
+    taskSpec:
+      params:
+      - name: msg
+      steps:
+      - name: verify
+        image: mirror.gcr.io/busybox
+        script: |
+          echo "got $(params.msg)"
+          test "$(params.msg)" = "%s"
+`, parentPipelineName, namespace, childPipelineName, childPipelineName, childPipelineName, childPipelineName, childPipelineName, resultValue, childPipelineName, resultValue))
+
+	parentPipelineRun := parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: %s
+  uid: %s
+spec:
+  pipelineRef:
+    name: %s
+`, parentPipelineRunName, namespace, uid, parentPipelineName))
+
+	expectedName := parentPipelineRunName + "-" + childPipelineName
+	childObjectMeta := childPipelineRunWithObjectMeta(
+		expectedName,
+		namespace,
+		parentPipelineRunName,
+		parentPipelineName,
+		childPipelineName,
+		uid,
+	)
+	childObjectMeta.Labels[pipeline.PipelineLabelKey] = childPipelineName
+	expectedChildPipelineRun := parse.MustParseChildPipelineRunWithObjectMeta(
+		t,
+		childObjectMeta,
+		fmt.Sprintf(`
+spec:
+  pipelineRef:
+    name: %s
+  taskRunTemplate:
+    serviceAccountName: default
+`, childPipelineName),
+	)
+
+	wantResults := []v1.PipelineRunResult{{
+		Name:  "propagated",
+		Value: *v1.NewStructuredValues(resultValue),
+	}}
+
+	return parentPipeline, childPipeline, parentPipelineRun, expectedChildPipelineRun, wantResults
+}
+
 func WithAnnotationAndLabel(pr *v1.PipelineRun, withUnused bool) *v1.PipelineRun {
 	if pr.Annotations == nil {
 		pr.Annotations = map[string]string{}
