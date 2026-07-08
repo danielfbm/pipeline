@@ -1227,6 +1227,14 @@ func getConsumerTaskRun(ctx context.Context, t *testing.T, clients test.Clients,
 	return consumerTaskRun
 }
 
+// assertPipelineRunResults fails the test unless the PipelineRun's status.Results equals expected.
+func assertPipelineRunResults(t *testing.T, run *v1.PipelineRun, expected []v1.PipelineRunResult) {
+	t.Helper()
+	if d := cmp.Diff(expected, run.Status.Results); d != "" {
+		t.Errorf("Expected parent PipelineRun results to aggregate the child PipelineRun result. Diff %s", diff.PrintWantGot(d))
+	}
+}
+
 // TestReconcile_ChildPipelineRunResultsPropagation verifies the full results-propagation
 // flow for Pipelines-in-Pipelines (TEP-0056) through the real Reconcile loop:
 //  1. Reconcile 1 creates the child PipelineRun for the pipelineRef task "child".
@@ -1308,10 +1316,7 @@ func TestReconcile_ChildPipelineRunResultsPropagation(t *testing.T) {
 		corev1.ConditionTrue,
 		v1.PipelineRunReasonSuccessful.String(),
 	)
-	expectedResults := []v1.PipelineRunResult{{Name: "parent-out", Value: *v1.NewStructuredValues("hello-from-child")}}
-	if d := cmp.Diff(expectedResults, finalRun.Status.Results); d != "" {
-		t.Errorf("Expected parent PipelineRun results to aggregate the child PipelineRun result. Diff %s", diff.PrintWantGot(d))
-	}
+	assertPipelineRunResults(t, finalRun, []v1.PipelineRunResult{{Name: "parent-out", Value: *v1.NewStructuredValues("hello-from-child")}})
 }
 
 // TestReconcile_ChildPipelineRunResultsChainedToChildPipeline verifies that a child
@@ -1401,7 +1406,7 @@ func TestReconcile_ChildPipelineRunResultsPropagation_MissingResult(t *testing.T
 	// result, and its (separate) failure to resolve would otherwise return a
 	// non-permanent error from the reconciler; this test isolates the
 	// CheckMissingResultReferences behavior for the consumer task.
-	parentPipeline.Spec.Results = nil
+	th.WithResults(parentPipeline, nil)
 
 	// Reconcile 1: the child PipelineRun is created.
 	testData := test.Data{
@@ -1470,11 +1475,11 @@ func TestReconcile_ChildPipelineRunResultsPropagation_WhenSkipped(t *testing.T) 
 	parentPipeline, childPipeline, parentPipelineRun :=
 		th.OnePipelineRefInPipelineWithResults(t, namespace, parentPipelineRunName)
 	// Guard the consumer task with a when expression on the child pipeline's result.
-	parentPipeline.Spec.Tasks[1].When = v1.WhenExpressions{{
+	th.WithTaskWhen(t, parentPipeline, "consumer", v1.WhenExpressions{{
 		Input:    "$(tasks.child.results.out)",
 		Operator: selection.In,
 		Values:   []string{"skip-me"},
-	}}
+	}})
 
 	// Reconcile 1: the child PipelineRun is created.
 	testData := test.Data{
@@ -1533,8 +1538,5 @@ func TestReconcile_ChildPipelineRunResultsPropagation_WhenSkipped(t *testing.T) 
 	}
 
 	// The child's result is still aggregated into the parent's pipeline results.
-	expectedResults := []v1.PipelineRunResult{{Name: "parent-out", Value: *v1.NewStructuredValues("hello-from-child")}}
-	if d := cmp.Diff(expectedResults, reconciledRun.Status.Results); d != "" {
-		t.Errorf("Expected parent PipelineRun results to aggregate the child PipelineRun result. Diff %s", diff.PrintWantGot(d))
-	}
+	assertPipelineRunResults(t, reconciledRun, []v1.PipelineRunResult{{Name: "parent-out", Value: *v1.NewStructuredValues("hello-from-child")}})
 }

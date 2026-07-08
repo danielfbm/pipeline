@@ -1002,7 +1002,7 @@ func TestPipelineRun_PinP_ResultsPropagation(t *testing.T) {
 	// GIVEN: a child Pipeline declaring string, array and object results and a parent
 	// consuming them in params, when expressions, a finally task and pipeline results.
 	parentPipeline, childPipeline, parentPipelineRun :=
-		th.PipelineRefInPipelineWithManyResults(t, namespace, "pr-pinp-results")
+		th.OnePipelineRefInPipelineWithManyResults(t, namespace, "pr-pinp-results")
 	childPipelineRunName := parentPipelineRun.Name + "-child"
 
 	// WHEN: the parent only succeeds if the consumer's in-script verification of every
@@ -1060,17 +1060,19 @@ func TestPipelineRun_PinP_ResultsPropagationUndeclaredResult(t *testing.T) {
 	knativetest.CleanupOnInterrupt(func() { tearDown(ctx, t, c, namespace) }, t.Logf)
 	defer tearDown(ctx, t, c, namespace)
 
-	// GIVEN: the parent's consumer references $(tasks.child.results.missing), which the
-	// child Pipeline does not declare.
+	// GIVEN: the child Pipeline declares no results, so the parent's consumer reference to
+	// $(tasks.child.results.out) points at a result the child does not declare.
 	parentPipeline, childPipeline, parentPipelineRun :=
-		th.PipelineRefInPipelineWithUndeclaredResult(t, namespace, "pr-pinp-undeclared-result")
+		th.OnePipelineRefInPipelineWithResults(t, namespace, "pr-pinp-undeclared-result")
+	th.WithResults(childPipeline, nil)
+	th.WithResults(parentPipeline, nil)
 
 	// WHEN / THEN: the parent fails with InvalidTaskResultReference at runtime.
 	createResourcesAndWaitForPipelineRun(ctx, t, c, namespace,
 		[]*v1.Pipeline{parentPipeline, childPipeline}, parentPipelineRun, nil,
 		Chain(
 			FailedWithReason(v1.PipelineRunReasonInvalidTaskResultReference.String(), parentPipelineRun.Name),
-			FailedWithMessage(`"missing" is not a named result returned by pipeline task "child"`, parentPipelineRun.Name),
+			FailedWithMessage(`"out" is not a named result returned by pipeline task "child"`, parentPipelineRun.Name),
 		),
 		"PipelineRunFailed")
 }

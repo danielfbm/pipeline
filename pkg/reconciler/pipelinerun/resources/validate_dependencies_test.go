@@ -271,23 +271,33 @@ func TestValidatePipelineTaskResults_MissingTaskSpec(t *testing.T) {
 	}
 }
 
-// TestValidatePipelineTaskResults_ChildPipelineValidStates tests that result references
-// pointing to results declared by a child Pipeline's spec do not trigger validation errors.
-func TestValidatePipelineTaskResults_ChildPipelineValidStates(t *testing.T) {
-	child := &prresources.ResolvedPipelineTask{
+// childOutSpec returns a child Pipeline spec that declares a single string result "out".
+func childOutSpec() *v1.PipelineSpec {
+	return &v1.PipelineSpec{
+		Results: []v1.PipelineResult{{
+			Name:  "out",
+			Value: *v1.NewStructuredValues("$(tasks.t1.results.out)"),
+		}},
+	}
+}
+
+// childPipelineResolvedTask returns a resolved child-Pipeline task (pipelineRef
+// "child-pipeline") with the given resolved pipeline spec; pass nil to simulate a child
+// whose spec has not been resolved.
+func childPipelineResolvedTask(spec *v1.PipelineSpec) *prresources.ResolvedPipelineTask {
+	return &prresources.ResolvedPipelineTask{
 		PipelineTask: &v1.PipelineTask{
 			Name:        "child",
 			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
 		},
-		ResolvedPipeline: prresources.ResolvedPipeline{
-			PipelineSpec: &v1.PipelineSpec{
-				Results: []v1.PipelineResult{{
-					Name:  "out",
-					Value: *v1.NewStructuredValues("$(tasks.t1.results.out)"),
-				}},
-			},
-		},
+		ResolvedPipeline: prresources.ResolvedPipeline{PipelineSpec: spec},
 	}
+}
+
+// TestValidatePipelineTaskResults_ChildPipelineValidStates tests that result references
+// pointing to results declared by a child Pipeline's spec do not trigger validation errors.
+func TestValidatePipelineTaskResults_ChildPipelineValidStates(t *testing.T) {
+	child := childPipelineResolvedTask(childOutSpec())
 	for _, tc := range []struct {
 		desc  string
 		state prresources.PipelineRunState
@@ -329,28 +339,18 @@ func TestValidatePipelineTaskResults_ChildPipelineValidStates(t *testing.T) {
 // reference to a result not declared by the child Pipeline's spec is correctly caught
 // by the validatePipelineTaskResults func.
 func TestValidatePipelineTaskResults_ChildPipelineIncorrectResultName(t *testing.T) {
-	state := prresources.PipelineRunState{{
-		PipelineTask: &v1.PipelineTask{
-			Name:        "child",
-			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
-		},
-		ResolvedPipeline: prresources.ResolvedPipeline{
-			PipelineSpec: &v1.PipelineSpec{
-				Results: []v1.PipelineResult{{
-					Name:  "out",
-					Value: *v1.NewStructuredValues("$(tasks.t1.results.out)"),
+	state := prresources.PipelineRunState{
+		childPipelineResolvedTask(childOutSpec()),
+		{
+			PipelineTask: &v1.PipelineTask{
+				Name: "consumer",
+				Params: []v1.Param{{
+					Name:  "p",
+					Value: *v1.NewStructuredValues("$(tasks.child.results.missing)"),
 				}},
 			},
 		},
-	}, {
-		PipelineTask: &v1.PipelineTask{
-			Name: "consumer",
-			Params: []v1.Param{{
-				Name:  "p",
-				Value: *v1.NewStructuredValues("$(tasks.child.results.missing)"),
-			}},
-		},
-	}}
+	}
 	err := prresources.ValidatePipelineTaskResults(state)
 	if err == nil || !strings.Contains(err.Error(), `"missing" is not a named result returned by pipeline task "child"`) {
 		t.Errorf("unexpected error: %v", err)
@@ -361,23 +361,18 @@ func TestValidatePipelineTaskResults_ChildPipelineIncorrectResultName(t *testing
 // child pipeline task with no resolved pipeline spec results in a validation error being
 // returned.
 func TestValidatePipelineTaskResults_ChildPipelineMissingPipelineSpec(t *testing.T) {
-	state := prresources.PipelineRunState{{
-		PipelineTask: &v1.PipelineTask{
-			Name:        "child",
-			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
+	state := prresources.PipelineRunState{
+		childPipelineResolvedTask(nil),
+		{
+			PipelineTask: &v1.PipelineTask{
+				Name: "consumer",
+				Params: []v1.Param{{
+					Name:  "p",
+					Value: *v1.NewStructuredValues("$(tasks.child.results.out)"),
+				}},
+			},
 		},
-		ResolvedPipeline: prresources.ResolvedPipeline{
-			PipelineSpec: nil,
-		},
-	}, {
-		PipelineTask: &v1.PipelineTask{
-			Name: "consumer",
-			Params: []v1.Param{{
-				Name:  "p",
-				Value: *v1.NewStructuredValues("$(tasks.child.results.out)"),
-			}},
-		},
-	}}
+	}
 	err := prresources.ValidatePipelineTaskResults(state)
 	if err == nil || !strings.Contains(err.Error(), `pipeline spec not found`) {
 		t.Errorf("unexpected error: %v", err)
@@ -484,20 +479,7 @@ func TestValidatePipelineResults_ChildPipelineValidStates(t *testing.T) {
 			Value: *v1.NewStructuredValues("$(tasks.child.results.out)"),
 		}},
 	}
-	state := prresources.PipelineRunState{{
-		PipelineTask: &v1.PipelineTask{
-			Name:        "child",
-			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
-		},
-		ResolvedPipeline: prresources.ResolvedPipeline{
-			PipelineSpec: &v1.PipelineSpec{
-				Results: []v1.PipelineResult{{
-					Name:  "out",
-					Value: *v1.NewStructuredValues("$(tasks.t1.results.out)"),
-				}},
-			},
-		},
-	}}
+	state := prresources.PipelineRunState{childPipelineResolvedTask(childOutSpec())}
 	if err := prresources.ValidatePipelineResults(spec, state); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -513,20 +495,7 @@ func TestValidatePipelineResults_ChildPipelineIncorrectResultName(t *testing.T) 
 			Value: *v1.NewStructuredValues("$(tasks.child.results.missing)"),
 		}},
 	}
-	state := prresources.PipelineRunState{{
-		PipelineTask: &v1.PipelineTask{
-			Name:        "child",
-			PipelineRef: &v1.PipelineRef{Name: "child-pipeline"},
-		},
-		ResolvedPipeline: prresources.ResolvedPipeline{
-			PipelineSpec: &v1.PipelineSpec{
-				Results: []v1.PipelineResult{{
-					Name:  "out",
-					Value: *v1.NewStructuredValues("$(tasks.t1.results.out)"),
-				}},
-			},
-		},
-	}}
+	state := prresources.PipelineRunState{childPipelineResolvedTask(childOutSpec())}
 	err := prresources.ValidatePipelineResults(spec, state)
 	if err == nil || !strings.Contains(err.Error(), `"missing" is not a named result returned by pipeline task "child"`) {
 		t.Errorf("unexpected error: %v", err)
