@@ -89,10 +89,6 @@ func (ps *PipelineSpec) Validate(ctx context.Context) (errs *apis.FieldError) {
 	errs = errs.Also(validatePipelineWorkspacesDeclarations(ps.Workspaces))
 	// Validate the pipeline's results
 	errs = errs.Also(validatePipelineResults(ps.Results, ps.Tasks, ps.Finally))
-	// Reject result references to PipelineTasks that use pipelineRef or pipelineSpec.
-	// Result propagation from a child Pipeline is not implemented in the initial
-	// Pipelines-in-Pipelines alpha; see docs/pipelines-in-pipelines.md#limitations.
-	errs = errs.Also(validatePipelineRefResultReferencesDisallowed(ps.Tasks, ps.Finally))
 	errs = errs.Also(validateTasksAndFinallySection(ps))
 	errs = errs.Also(validateFinalTasks(ps.Tasks, ps.Finally))
 	errs = errs.Also(validateWhenExpressions(ctx, ps.Tasks, ps.Finally))
@@ -258,6 +254,11 @@ func (pt *PipelineTask) validateMatrix(ctx context.Context) (errs *apis.FieldErr
 		errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "matrix", config.BetaAPIFields))
 		errs = errs.Also(pt.Matrix.validateCombinationsCount(ctx))
 		errs = errs.Also(pt.Matrix.validateUniqueParams())
+		// Matrix fan-out of a child Pipeline (Pipelines-in-Pipelines) is not supported:
+		// the reconciler and result propagation assume a single child PipelineRun.
+		if pt.PipelineRef != nil || pt.PipelineSpec != nil {
+			errs = errs.Also(apis.ErrGeneric("matrix is not supported for a PipelineTask that uses pipelineRef or pipelineSpec", "matrix"))
+		}
 	}
 	errs = errs.Also(pt.Matrix.validateParameterInOneOfMatrixOrParams(pt.Params))
 	return errs
@@ -735,43 +736,6 @@ func validateTasksAndFinallySection(ps *PipelineSpec) *apis.FieldError {
 		return apis.ErrInvalidValue(fmt.Sprintf("spec.tasks is empty but spec.finally has %d tasks", len(ps.Finally)), "finally")
 	}
 	return nil
-}
-
-// validatePipelineRefResultReferencesDisallowed rejects any result reference
-// (`$(tasks.<name>.results.*)` or `$(finally.<name>.results.*)`) whose target
-// PipelineTask is a Pipeline-in-Pipeline (uses pipelineRef or pipelineSpec).
-//
-// Result propagation from a child Pipeline is not yet implemented: the
-// reconciler's convertToResultRefs path reads from ResolvedPipelineTask.TaskRuns
-// which is empty for a child-pipeline task, so without this guard such a
-// reference would panic the controller at runtime. Once propagation lands,
-// this guard can be removed.
-func validatePipelineRefResultReferencesDisallowed(tasks []PipelineTask, finally []PipelineTask) (errs *apis.FieldError) {
-	pipelineRefTasks := sets.NewString()
-	for _, t := range tasks {
-		if t.PipelineRef != nil || t.PipelineSpec != nil {
-			pipelineRefTasks.Insert(t.Name)
-		}
-	}
-	if pipelineRefTasks.Len() == 0 {
-		return nil
-	}
-
-	check := func(pts []PipelineTask, field string) {
-		for idx, pt := range pts {
-			for _, ref := range PipelineTaskResultRefs(&pt) {
-				if pipelineRefTasks.Has(ref.PipelineTask) {
-					errs = errs.Also(apis.ErrInvalidValue(
-						fmt.Sprintf("result reference to pipelineTask %q is not supported: referenced task uses pipelineRef or pipelineSpec and result propagation from child Pipelines is not yet implemented",
-							ref.PipelineTask),
-						"").ViaFieldIndex(field, idx))
-				}
-			}
-		}
-	}
-	check(tasks, "tasks")
-	check(finally, "finally")
-	return errs
 }
 
 func validateFinalTasks(tasks []PipelineTask, finalTasks []PipelineTask) (errs *apis.FieldError) {

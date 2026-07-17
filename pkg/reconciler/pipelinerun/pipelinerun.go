@@ -964,9 +964,17 @@ func (c *Reconciler) reconcile(ctx context.Context, pr *v1.PipelineRun, getPipel
 	pipelineTaskStatus = kmap.Union(pipelineTaskStatus, finalPipelineTaskStatus)
 
 	if after.Status == corev1.ConditionTrue || after.Status == corev1.ConditionFalse {
+		// Results from completed child PipelineRuns (Pipelines-in-Pipelines) are
+		// consumable exactly like results of regular pipeline tasks, so merge them
+		// into the same map. Pipeline task names are unique, so there are no
+		// key collisions.
+		taskRunResults := pipelineRunFacts.State.GetTaskRunsResults()
+		for pipelineTaskName, childResults := range pipelineRunFacts.State.GetChildPipelineRunResults() {
+			taskRunResults[pipelineTaskName] = childResults
+		}
 		pr.Status.Results, err = resources.ApplyTaskResultsToPipelineResults(
 			pipelineSpec.Results,
-			pipelineRunFacts.State.GetTaskRunsResults(),
+			taskRunResults,
 			pipelineRunFacts.State.GetRunsResults(),
 			pipelineTaskStatus,
 		)

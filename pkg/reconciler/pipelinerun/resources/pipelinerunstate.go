@@ -203,6 +203,42 @@ func (state PipelineRunState) GetTaskRunsResults() map[string][]v1.TaskRunResult
 	return results
 }
 
+// GetChildPipelineRunResults returns a map of all completed child PipelineRuns
+// (Pipelines-in-Pipelines) in the state, with the pipeline task name as the key and the
+// results from the corresponding child PipelineRun converted to TaskRunResults as the
+// value. It includes child pipelines which have completed successfully or with failure
+// (including cancelled and timed-out, see GetTaskRunsResults comment). Matrix fan-out of
+// a child Pipeline is not supported, so the results always come from the single child
+// PipelineRun.
+func (state PipelineRunState) GetChildPipelineRunResults() map[string][]v1.TaskRunResult {
+	results := make(map[string][]v1.TaskRunResult)
+	for _, rpt := range state {
+		if !rpt.IsChildPipeline() {
+			continue
+		}
+		if !rpt.isSuccessful() && !rpt.isFailure() {
+			continue
+		}
+		results[rpt.PipelineTask.Name] = convertPipelineRunResultsToTaskRunResults(rpt.ChildPipelineRuns[0].Status.Results)
+	}
+	return results
+}
+
+// convertPipelineRunResultsToTaskRunResults converts the results reported by a child
+// PipelineRun to TaskRunResults so they can be consumed wherever results of a regular
+// pipeline task are consumed.
+func convertPipelineRunResultsToTaskRunResults(pipelineRunResults []v1.PipelineRunResult) []v1.TaskRunResult {
+	taskRunResults := make([]v1.TaskRunResult, 0, len(pipelineRunResults))
+	for _, result := range pipelineRunResults {
+		taskRunResults = append(taskRunResults, v1.TaskRunResult{
+			Name:  result.Name,
+			Type:  v1.ResultsType(result.Value.Type),
+			Value: result.Value,
+		})
+	}
+	return taskRunResults
+}
+
 // GetTaskRunsArtifacts returns a map of all completed TaskRuns in the state, with the pipeline task name as
 // the key and the artifacts from the corresponding TaskRun as the value. It includes tasks which have completed
 // successfully or with failure (including cancelled and timed-out, see GetTaskRunsResults comment).
